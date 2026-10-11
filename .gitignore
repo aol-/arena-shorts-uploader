@@ -1,0 +1,9 @@
+dist/
+*.tar.gz
+*.zip
+__pycache__/
+*.pyc
+token.json
+client_secrets.json
+queue/
+.DS_Store
