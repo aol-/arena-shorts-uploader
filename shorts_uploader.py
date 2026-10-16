@@ -10,6 +10,18 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+# Ensure site-packages with cv2, rapidocr_onnxruntime, etc. are available
+dictate_site = os.path.expanduser("~/.local/share/dictate-env/lib/python3.14/site-packages")
+if os.path.exists(dictate_site) and dictate_site not in sys.path:
+    sys.path.insert(0, dictate_site)
+
+# Limit OCR / ONNX / OpenMP thread explosion to keep system smooth
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "4")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
+
 # Google API imports (loaded lazily if credentials present)
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -21,63 +33,95 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 TOKEN_FILE = CONFIG_DIR / "token.json"
 CLIENT_SECRETS_FILE = CONFIG_DIR / "client_secrets.json"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+OVERRIDES_FILE = CONFIG_DIR / "clip_overrides.json"
 
 TEMPLATES_WITH_ENEMY_AND_WEAPON = [
-    "{player} ABSOLUTELY DELETES {enemy} WITH THE {weapon}! 🎯💀 [Quake Live 1440p]",
-    "{player} HITS THE NASTIEST {weapon} FRAG ON {enemy}! 🚀🔥 (Quake Live 1440p)",
-    "{player} CAUGHT {enemy} LACKING! SICK {weapon} PLAY 💀⚡ [Quake Live]",
-    "{player} OUTPLAYS {enemy}! 200 IQ {weapon} PREDICTION 🎯🧠 (Quake Live)",
-    "THE CLEANEST {weapon} HIT YOU'LL SEE TODAY! {player} vs {enemy} 💥🔥",
-    "{player} SENDS {enemy} TO THE SHADOW REALM! {weapon} FRAG 💀🚀 (Quake Live)",
-    "PURE DISRESPECT! {player} ENDS {enemy} WITH THE {weapon} 🪚💀 [Quake Live 1440p]",
-    "NO MERCY! {player} HITS A GOD-TIER {weapon} SHOT ON {enemy} 🎯🔥 (Quake Live)",
-    "{player} PREDICTED THE MOVEMENT! UNREAL {weapon} FRAG ON {enemy} 🚀💥",
-    "{player} WITH THE FILTHY {weapon} FLICK ON {enemy}! 🎯⚡ [Quake Live 1440p]"
+    "SICK {weapon} PLAY! ⚡💀 {player} vs {enemy}",
+    "CLUTCH {weapon} FRAG! 🚀💥 {player} vs {enemy}",
+    "INSANE {weapon} PREDICTION! 🎯🧠 {player} vs {enemy}",
+    "POINT-BLANK {weapon} ELIMINATION! 💥🔥 {player} vs {enemy}",
+    "CLEAN {weapon} DUEL WIN! 🎯⚡ {player} vs {enemy}",
+    "NASTY {weapon} FLICK! 🚀💀 {player} vs {enemy}",
+    "200 IQ {weapon} OUTPLAY! 🧠💥 {player} vs {enemy}",
+    "GOD-TIER {weapon} HIT! 🎯🔥 {player} vs {enemy}"
 ]
 
 TEMPLATES_WITH_ENEMY_ONLY = [
-    "{player} OUTPLAYS {enemy} IN CLAN ARENA! 💀🔥 [Quake Live 1440p]",
-    "{player} SENDS {enemy} PACKING! INSANE FRAG 🚀💥 (Quake Live)",
-    "{player} CAUGHT {enemy} SLEEPING! CLEAN CLAN ARENA FRAG 🎯💀",
-    "{player} WITH THE CLUTCH PLAY AGAINST {enemy}! 🔥⚡ [Quake Live 1440p]",
-    "{player} SHOWS NO MERCY TO {enemy}! UNREAL ARENA DUEL 💀🎯"
+    "CLUTCH ARENA DUEL! 💀🔥 {player} vs {enemy}",
+    "INSANE ROUND-ENDING FRAG! 🚀💥 {player} vs {enemy}",
+    "CLEAN CLAN ARENA ELIMINATION! 🎯💀 {player} vs {enemy}",
+    "UNREAL ARENA OUTPLAY! 🔥⚡ {player} vs {enemy}"
 ]
 
 TEMPLATES_WITH_WEAPON_ONLY = [
-    "{player} HITS A DISGUSTING {weapon} FRAG! 🚀💥 [Quake Live 1440p]",
-    "{player} WITH THE GOD-TIER {weapon} FLICK! 🎯🔥 (Quake Live)",
-    "{player} MELTS OPPONENTS WITH THE {weapon}! ⚡💀 [Quake Live 1440p]",
-    "THE CLEANEST {weapon} SHOT! {player} CLUTCH 💥🔥 (Quake Live)",
-    "{player} SHOWS HOW TO USE THE {weapon}! PURE FILTH 🎯💀 [Quake Live 1440p]",
-    "{player} WITH THE INSANE {weapon} PREDICTION! 🚀🔥 (Quake Live)"
+    "DISGUSTING {weapon} FRAG! 🚀💥 {player}",
+    "GOD-TIER {weapon} FLICK! 🎯🔥 {player}",
+    "MELTING OPPONENTS WITH {weapon}! ⚡💀 {player}",
+    "CLEANEST {weapon} SHOT! 💥🔥 {player}",
+    "PURE FILTH WITH THE {weapon}! 🎯💀 {player}",
+    "INSANE {weapon} PREDICTION! 🚀🔥 {player}"
+]
+
+TEMPLATES_TWO_FRAGS_GENERIC = [
+    "DOUBLE FRAG! 💀⚡ {player} vs {enemy}",
+    "2 FRAGS! 💀🔥 {player} vs {enemy}",
+    "TWO DOWN! 🚀💥 {player} vs {enemy}",
+    "NASTY DOUBLE FRAG! 💀⚡ {player} vs {enemy}",
+    "CLEAN 2-FRAG HIGHLIGHT! 🎯💀 {player} vs {enemy}"
 ]
 
 TEMPLATES_SPECIAL_FEATS = {
+    "Impressive Medal": [
+        "IMPRESSIVE MEDAL VIA CONSECUTIVE RAILS! 🎯⚡ {player} vs {enemy}",
+        "IMPRESSIVE! BACK-TO-BACK RAILGUN HITS! 🎯💀 {player} vs {enemy}",
+        "GOD-TIER RAIL ACCURACY! IMPRESSIVE MEDAL ⚡🎯 {player} vs {enemy}"
+    ],
+    "Two Frags in Two Seconds": [
+        "TWO FRAGS IN TWO SECONDS! 💀⚡ {player} vs {enemy}",
+        "2 FRAGS IN 2 SECONDS! 💀🔥 {player} vs {enemy}",
+        "EXCELLENT AWARD! 2 FRAGS IN 2 SECONDS 💀⚡ {player} vs {enemy}"
+    ],
+    "Excellent Medal": [
+        "EXCELLENT MEDAL! 2 FAST FRAGS 💀⚡ {player} vs {enemy}",
+        "2 FRAGS IN 2 SECONDS! 💀🔥 {player} vs {enemy}"
+    ],
+    "Round-Ending Telefrag": [
+        "ROUND-ENDING TELEFRAG! 🌀🏆 {player} vs {enemy}",
+        "CLUTCH ROUND-ENDING TELEFRAG! 🌀🔥 {player} vs {enemy}",
+        "INSANE ROUND-ENDING TELEFRAG! 🌀💀 {player} vs {enemy}"
+    ],
+    "Telefrag": [
+        "DISGUSTING TELEFRAG! 🌀💀 {player} vs {enemy}",
+        "WRONG PLACE, WRONG TIME TELEFRAG! 🌀💥 {player} vs {enemy}",
+        "UNREAL TIMING TELEFRAG! 🌀⚡ {player} vs {enemy}"
+    ],
+    "Round-Ending Frag": [
+        "CLUTCH ROUND-ENDING FRAG! 🏆🔥 {player} vs {enemy}",
+        "SEALING THE ROUND VICTORY! 💥🏆 {player} vs {enemy}",
+        "ROUND-ENDING CLUTCH! 🎯🏆 {player} vs {enemy}"
+    ],
     "Back-to-Back Double Rails": [
-        "{player} HITS BACK-TO-BACK DOUBLE RAILS?! 🎯💥 2 SINGLES INTO 2 COLLATERALS! [Quake Live 1440p]",
-        "4 SHOTS, 6 RAILS?! {player} UNREAL COLLATERAL STREAK vs {enemy} 💀🔥 [Quake Live]",
-        "{player} 2 SINGLES INTO 2 DOUBLE RAILS IN A ROW! 🎯💀 PURE RAILGUN FILTH (Quake Live)",
-        "{player} WITH THE DISGUSTING DOUBLE COLLATERAL RAILGUN STREAK! 🎯⚡ [Quake Live 1440p]",
-        "BACK-TO-BACK DOUBLE RAILS IN THE TUNNEL! 🎯💥 {player} DELETES {enemy} (Quake Live)"
+        "BACK-TO-BACK DOUBLE RAILS! 🎯💥 {player} vs {enemy}",
+        "4 SHOTS, 6 RAILS! UNREAL COLLATERALS 💀🔥 {player} vs {enemy}",
+        "DOUBLE COLLATERAL RAILGUN STREAK! 🎯⚡ {player} vs {enemy}"
     ],
     "Double Rail / Collateral": [
-        "{player} HITS THE DISGUSTING DOUBLE RAIL COLLATERAL! 🎯💥 [Quake Live 1440p]",
-        "ONE SHOT, TWO KILLS! {player} INSANE DOUBLE RAIL on {enemy} 💀⚡ (Quake Live)",
-        "{player} WITH THE FILTHY PIERCING DOUBLE RAIL! 🎯🔥 [Quake Live 1440p]",
-        "COLLATERAL RAILGUN DAMAGE! {player} DELETES {enemy} 💀🎯 (Quake Live)"
+        "DOUBLE RAIL COLLATERAL! 🎯💥 {player} vs {enemy}",
+        "ONE SHOT, TWO KILLS! DOUBLE RAIL 💀⚡ {player} vs {enemy}",
+        "PIERCING DOUBLE RAIL! 🎯🔥 {player} vs {enemy}"
     ],
     "Air Rocket / Direct": [
-        "{player} WITH THE NASTY MIDAIR AIR-ROCKET PREDICTION! 🚀🎯 (Quake Live 1440p)",
-        "DELETED OUT OF THE SKY! {player} SICK AIR ROCKET on {enemy} 🚀💥 [Quake Live]",
-        "{player} HITS A DISGUSTING MIDAIR DIRECT HIT! 🚀🔥 (Quake Live)"
+        "MIDAIR AIR-ROCKET PREDICTION! 🚀🎯 {player} vs {enemy}",
+        "DELETED OUT OF THE SKY! AIR ROCKET 🚀💥 {player} vs {enemy}",
+        "MIDAIR DIRECT HIT! 🚀🔥 {player} vs {enemy}"
     ],
     "Midair Railgun": [
-        "{player} SNIPES {enemy} OUT OF MIDAIR! GOD-TIER RAIL FLICK 🎯⚡ [Quake Live 1440p]",
-        "SKEET SHOOTING IN QUAKE LIVE! {player} MIDAIR RAIL ON {enemy} 🎯💀 (1440p)"
+        "MIDAIR RAIL FLICK! SNIPED OUT OF THE SKY 🎯⚡ {player} vs {enemy}",
+        "SKEET SHOOTING MIDAIR RAIL! 🎯💀 {player} vs {enemy}"
     ],
     "Clutch / Wipeout": [
-        "{player} 1vX CLUTCH IN CLAN ARENA! UNREAL WIPEOUT 💀🔥 [Quake Live 1440p]",
-        "HE WON THAT?! {player} IMPOSSIBLE CLAN ARENA CLUTCH vs {enemy} 🚀🎯 (Quake Live)"
+        "1vX CLAN ARENA CLUTCH! UNREAL WIPEOUT 💀🔥 {player} vs {enemy}",
+        "IMPOSSIBLE CLAN ARENA CLUTCH! 🚀🎯 {player} vs {enemy}"
     ]
 }
 
@@ -106,7 +150,14 @@ def load_config():
         "category_id": "20",         # 20 = Gaming
         "shorts_mode": True,         # Automatically format <=60s clips as 9:16 YouTube Shorts
         "shorts_style": "crop",      # "crop" (full-screen vertical trim) or "blur" (blurred background)
-        "dual_upload": True,         # Also upload original 16:9 widescreen 1440p version alongside Shorts
+        "dual_upload": False,        # Upload only 9:16 vertical Shorts by default (no widescreen duplicate)
+        "cut_on_death": True,        # Stop video when player dies and do not show respawn
+        "cut_before_respawn": True,  # Cut ending right before respawn countdown / scoreboard happens
+        "cut_recording_chime": True, # Automatically detect and cut Steam Keypad + recording notification chime
+        "display_left_chat": True,   # Display left-side chat and announcements at bottom of Shorts
+        "death_cutoff_delay": 0.5,   # Extra seconds after death message to show fatal hit
+        "audio_loudness_i": -15.0,   # Integrated loudness target (LUFS)
+        "audio_true_peak": -1.5,     # True peak ceiling (dBFS)
         "tags": ["Quake Live", "Quake", "FPS", "Gameplay", "Steam Recording"]
     }
     if CONFIG_FILE.exists():
@@ -124,10 +175,12 @@ IGNORE_WORDS = {
     'fps', '250fps', '250f', 'mega', 'quad', 'stairs', 'the', 'and', 'red', 'blue', 'draw',
     'k/d', 'score', 'ping', 'time', 'dmg', 'acc', 'lead', 'tied', 'red wins the round',
     'matchinprogress', 'players', 'community server', 'community server - overkill',
-    'player stats', 'player', 'dmg weap'
+    'player stats', 'player', 'dmg weap', 'item to use', 'no item to use', 'item to u',
+    'dead and gone', 'dead and', 'community server - dead and gone', 'community server - aerowalk',
+    'aerowalk', 'verticalvengeance', 'overkill', '12players', 'veap', 'the last s', 'last s'
 }
 
-def clean_player_name(raw: str) -> str:
+def clean_player_name(raw: str, server_players: list = None) -> str:
     s = raw.strip()
     s = re.sub(r'\s*\d+fps.*$', '', s, flags=re.I)
     s = re.sub(r'^(red|blue)\s+team\s*', '', s, flags=re.I)
@@ -142,6 +195,15 @@ def clean_player_name(raw: str) -> str:
         return ''
     if s.lower() in ['player', 'you']:
         return ''
+    if server_players:
+        import difflib
+        matches = difflib.get_close_matches(s, server_players, n=1, cutoff=0.7)
+        if matches:
+            return matches[0]
+        if len(s) >= 3:
+            for sp in server_players:
+                if sp.lower().startswith(s.lower()):
+                    return sp
     return s.strip()
 
 def analyze_video_gameplay(video_path: str) -> dict:
@@ -168,15 +230,29 @@ def analyze_video_gameplay(video_path: str) -> dict:
             return result
         duration = total_frames / fps
 
-        # Sample 10 frames across the clip weighted towards combat/kill action
-        percentages = [0.35, 0.45, 0.55, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+        # Sample 12 frames across the clip weighted towards combat/kill action
+        percentages = [0.35, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
         frag_victims = Counter()
         killfeed_victims = Counter()
         combat_names = Counter()
+        frag_weapons = Counter()
         weapon_scores = Counter()
         has_double_rail = False
         has_air_rocket_medal = False
+        has_excellent_medal = False
+        is_telefrag = False
+        is_game_ending = False
+        has_humiliation = False
+        player_died = False
+
+        # Pre-fetch server players for fuzzy matching OCR text
+        server_players = []
+        try:
+            s_info = get_quake_server_info()
+            server_players = s_info.get("players", [])
+        except Exception:
+            pass
 
         for pct in percentages:
             ts = duration * pct
@@ -186,54 +262,7 @@ def analyze_video_gameplay(video_path: str) -> dict:
                 continue
             h, w, _ = frame.shape
 
-            # 1. Authoritative Frag Announcement ('You fragged <Player>.') in center-upper screen
-            frag_roi = frame[int(h * 0.12):int(h * 0.35), int(w * 0.30):int(w * 0.70)]
-            res_f, _ = engine(frag_roi)
-            for it in res_f or []:
-                t = it[1].strip()
-                m = re.search(r'you\s*fragged\s+([A-Za-z0-9_\u4e00-\u9fff™\.\-]+)', t, re.I)
-                if m:
-                    cn = clean_player_name(m.group(1))
-                    if cn:
-                        frag_victims[cn] += 20
-
-            # 2. Killfeed in top-left ('Player [weapon icon] <Victim>')
-            kf_roi = frame[int(h * 0.01):int(h * 0.12), int(w * 0.05):int(w * 0.45)]
-            res_kf, _ = engine(kf_roi)
-            for it in res_kf or []:
-                t = it[1].strip()
-                m = re.search(r'aol[_\.\s]+\s*([A-Za-z0-9_\u4e00-\u9fff™\.\-]+)', t, re.I)
-                if m:
-                    cn = clean_player_name(m.group(1))
-                    if cn:
-                        killfeed_victims[cn] += 10
-
-            # 3. Quake Live Midair Award Medal at top-center (green wreath + white wings)
-            award_roi = frame[int(h * 0.07):int(h * 0.18), int(w * 0.45):int(w * 0.55)]
-            hsv_award = cv2.cvtColor(award_roi, cv2.COLOR_BGR2HSV)
-            mask_wreath = cv2.inRange(hsv_award, (40, 100, 100), (85, 255, 255))
-            mask_wings = cv2.inRange(hsv_award, (0, 0, 200), (180, 50, 255))
-            if cv2.countNonZero(mask_wreath) > 25 and cv2.countNonZero(mask_wings) > 15:
-                has_air_rocket_medal = True
-
-            # 4. Center combat zone for damage numbers and target overhead nameplates
-            center_roi = frame[int(h * 0.25):int(h * 0.75), int(w * 0.25):int(w * 0.75)]
-            res_c, _ = engine(center_roi)
-
-            frame_damage = False
-            for it in res_c or []:
-                t = it[1].strip()
-                if t.isdigit() and int(t) in range(15, 120):
-                    frame_damage = True
-                elif "80" in t and len(t) >= 4:
-                    frame_damage = True
-                    has_double_rail = True
-                else:
-                    cn = clean_player_name(t)
-                    if cn:
-                        combat_names[cn] += 5 if pct >= 0.60 else 2
-
-            # 5. Weapon check from bottom-center active weapon icon
+            # Weapon check from bottom-center active weapon icon
             bc = frame[int(h * 0.90):int(h * 0.99), int(w * 0.42):int(w * 0.50)]
             hsv = cv2.cvtColor(bc, cv2.COLOR_BGR2HSV)
             mask_green = cv2.inRange(hsv, (35, 100, 100), (85, 255, 255))
@@ -251,10 +280,91 @@ def analyze_video_gameplay(video_path: str) -> dict:
                 current_wep = "Rocket Launcher"
             elif cv2.countNonZero(mask_yellow) > 30:
                 current_wep = "Lightning Gun"
-            elif cv2.countNonZero(mask_cyan) > 30:
+            elif cv2.countNonZero(mask_cyan) > 30 and has_humiliation:
                 current_wep = "Gauntlet"
 
-            if current_wep:
+            # 1. Authoritative Frag Announcement ('You fragged <Player>.') in center-upper screen
+            frag_roi = frame[int(h * 0.12):int(h * 0.35), int(w * 0.20):int(w * 0.80)]
+            res_f, _ = engine(frag_roi)
+            frame_frag_found = False
+            for it in res_f or []:
+                t = it[1].strip()
+                if re.search(r'fragged\s+by|following|you\s*died|you\s*were\s*fragged', t, re.I):
+                    player_died = True
+                if re.search(r'excellent', t, re.I) or re.search(r'two\s+frags', t, re.I):
+                    has_excellent_medal = True
+                if re.search(r'match\s*summary', t, re.I) or re.search(r'roundlimit', t, re.I) or re.search(r'wins\s+by\s+a\s+score', t, re.I) or re.search(r'wins\s+the\s+round', t, re.I):
+                    is_game_ending = True
+                m = re.search(r'(?:you\s*)?fragged\s+([A-Za-z0-9_\u4e00-\u9fff™\.\-]+)', t, re.I)
+                if m:
+                    cn = clean_player_name(m.group(1), server_players)
+                    if cn:
+                        frag_victims[cn] += 20
+                        frame_frag_found = True
+
+            if frame_frag_found and current_wep:
+                frag_weapons[current_wep] += 100
+
+            # 2. Killfeed in top-left ('Player [weapon icon] <Victim>')
+            kf_roi = frame[int(h * 0.01):int(h * 0.15), int(w * 0.05):int(w * 0.45)]
+            res_kf, _ = engine(kf_roi)
+            for it in res_kf or []:
+                t = it[1].strip()
+                if re.search(r'fragged\s+by|following', t, re.I):
+                    player_died = True
+                if re.search(r'telefrag', t, re.I):
+                    is_telefrag = True
+                m = re.search(r'aol[_\.\s]+\s*([A-Za-z0-9_\u4e00-\u9fff™\.\-]+)', t, re.I)
+                if m:
+                    cn = clean_player_name(m.group(1), server_players)
+                    if cn:
+                        killfeed_victims[cn] += 10
+                        if current_wep:
+                            frag_weapons[current_wep] += 50
+                    # Red skull icon between killer and victim indicates telefrag
+                    hsv_kf = cv2.cvtColor(kf_roi, cv2.COLOR_BGR2HSV)
+                    m_red1 = cv2.inRange(hsv_kf, (0, 160, 160), (10, 255, 255))
+                    m_red2 = cv2.inRange(hsv_kf, (170, 160, 160), (180, 255, 255))
+                    if cv2.countNonZero(m_red1 | m_red2) > 80:
+                        is_telefrag = True
+
+            # 3. Quake Live Medals at top-center (Midair wreath, Excellent yellow skull with wings)
+            award_roi = frame[int(h * 0.05):int(h * 0.22), int(w * 0.40):int(w * 0.60)]
+            hsv_award = cv2.cvtColor(award_roi, cv2.COLOR_BGR2HSV)
+            mask_wreath = cv2.inRange(hsv_award, (40, 100, 100), (85, 255, 255))
+            mask_wings = cv2.inRange(hsv_award, (0, 0, 200), (180, 50, 255))
+            if cv2.countNonZero(mask_wreath) > 25 and cv2.countNonZero(mask_wings) > 15:
+                has_air_rocket_medal = True
+            mask_gold = cv2.inRange(hsv_award, (18, 110, 110), (36, 255, 255))
+            if cv2.countNonZero(mask_gold) > 40:
+                has_excellent_medal = True
+
+            # 4. Center combat zone for damage numbers, medals, and target overhead nameplates
+            center_roi = frame[int(h * 0.25):int(h * 0.75), int(w * 0.25):int(w * 0.75)]
+            res_c, _ = engine(center_roi)
+
+            frame_damage = False
+            for it in res_c or []:
+                t = it[1].strip()
+                if re.search(r'fragged\s+by|following|you\s*died', t, re.I):
+                    player_died = True
+                if re.search(r'humiliation', t, re.I):
+                    has_humiliation = True
+                if re.search(r'telefrag', t, re.I):
+                    is_telefrag = True
+                if re.search(r'match\s*summary', t, re.I) or re.search(r'roundlimit', t, re.I) or re.search(r'wins\s+by\s+a\s+score', t, re.I) or re.search(r'wins\s+the\s+round', t, re.I):
+                    is_game_ending = True
+                if t.isdigit() and int(t) in range(15, 120):
+                    frame_damage = True
+                elif "80" in t and len(t) >= 4:
+                    frame_damage = True
+                    has_double_rail = True
+                else:
+                    cn = clean_player_name(t, server_players)
+                    if cn:
+                        combat_names[cn] += 5 if pct >= 0.60 else 2
+
+            if current_wep and not player_died:
                 pts = 1
                 if pct >= 0.60:
                     pts += 3
@@ -264,27 +374,54 @@ def analyze_video_gameplay(video_path: str) -> dict:
 
         cap.release()
 
-        # Tiered victim selection:
-        # Tier 1: Player explicitly fragged by Player
-        # Tier 2: Killfeed confirmation
-        # Tier 3: In-combat crosshair nameplate during sustained damage
+        # Multi-victim detection (captures both players in two-frag clips):
         top_enemies = []
-        if frag_victims:
-            top_enemies = [e[0] for e in frag_victims.most_common(2)]
-        elif killfeed_victims:
-            top_enemies = [e[0] for e in killfeed_victims.most_common(2)]
-        elif combat_names:
-            top_enemies = [e[0] for e in combat_names.most_common(2) if e[1] >= 4]
+        # Tier 1: Players explicitly fragged by Player ('You fragged <Victim>.')
+        for e, _ in frag_victims.most_common(2):
+            if e and e not in top_enemies:
+                top_enemies.append(e)
 
-        wep = weapon_scores.most_common(1)[0][0] if weapon_scores else "Railgun"
+        # Tier 2: Killfeed confirmation for additional victims
+        if len(top_enemies) < 2 and killfeed_victims:
+            for e, _ in killfeed_victims.most_common(2):
+                if e and e not in top_enemies:
+                    top_enemies.append(e)
+                    if len(top_enemies) >= 2:
+                        break
+
+        # Tier 3: In-combat crosshair nameplate during sustained combat/damage (single duel opponent if no frag confirmed)
+        if not top_enemies and combat_names:
+            for e, score in combat_names.most_common(5):
+                if e and score >= 3:
+                    top_enemies.append(e)
+                    break
+
+        if frag_weapons:
+            wep = frag_weapons.most_common(1)[0][0]
+        elif weapon_scores:
+            wep = weapon_scores.most_common(1)[0][0]
+        else:
+            wep = "Railgun"
+
+        if player_died:
+            is_game_ending = False
 
         feat = ""
-        if wep == "Rocket Launcher" and has_air_rocket_medal:
+        if is_telefrag:
+            wep = "Telefrag"
+            feat = "Round-Ending Telefrag" if (is_game_ending and not player_died) else "Telefrag"
+        elif is_game_ending and not player_died:
+            feat = "Round-Ending Frag"
+        elif has_excellent_medal and not player_died:
+            feat = "Two Frags in Two Seconds"
+        elif wep == "Rocket Launcher" and has_air_rocket_medal and not player_died:
             feat = "Air Rocket / Direct"
-        elif wep == "Railgun" and has_double_rail:
+        elif wep == "Railgun" and has_double_rail and not player_died:
             feat = "Back-to-Back Double Rails"
-        elif wep == "Gauntlet":
+        elif wep == "Gauntlet" and has_humiliation:
             feat = "Humiliation / Gauntlet"
+        elif wep == "Gauntlet" and not has_humiliation:
+            wep = "Railgun"
 
         result["enemy"] = " & ".join(top_enemies) if top_enemies else ""
         result["weapon"] = wep
@@ -300,11 +437,11 @@ def prompt_frag_details(video_path: str, player_name: str = "Player"):
         "zenity", "--forms",
         f"--title=Export to YouTube ({player_name})",
         f"--text=<b>Clip: {p.name}</b>\nAdd frag details to build an exciting title:\n<i>(Leave blank to auto-generate)</i>",
-        "--add-entry=Enemy Fragged (e.g. bong™, SERVAL)",
+        "--add-entry=Enemy Fragged (e.g. SnapWARP & The-Mangler, or blank to auto-detect)",
         "--add-combo=Weapon Used",
         "--combo-values=Railgun|Rocket Launcher|Lightning Gun|Shotgun|Gauntlet|Plasma Gun|Grenade Launcher|BFG",
         "--add-combo=Special Highlight / Feat",
-        "--combo-values=Auto / Standard Frag|Back-to-Back Double Rails|Double Rail / Collateral|Air Rocket / Direct|Midair Railgun|Clutch / Wipeout",
+        "--combo-values=Auto / Standard Frag|Two Frags in Two Seconds|Round-Ending Frag|Round-Ending Telefrag|Back-to-Back Double Rails|Double Rail / Collateral|Air Rocket / Direct|Midair Railgun|Clutch / Wipeout",
         "--add-entry=Custom Title Override (optional)",
         "--ok-label=Export & Upload",
         "--cancel-label=Cancel",
@@ -321,7 +458,10 @@ def prompt_frag_details(video_path: str, player_name: str = "Player"):
     return enemy, weapon, special_play, custom_title
 
 def extract_action_thumbnail(video_path: str, output_path: str = None) -> str:
-    """Extracts a high-action frame around 60% of the clip duration."""
+    """
+    Scans video frames to extract an action thumbnail featuring an upclose enemy,
+    combat action, damage dealt/produced, and weapon discharge.
+    """
     if not output_path:
         output_path = f"/tmp/thumb_{int(time.time())}.jpg"
     duration = 10.0
@@ -336,8 +476,64 @@ def extract_action_thumbnail(video_path: str, output_path: str = None) -> str:
     except Exception:
         pass
 
-    seek_time = max(1.0, duration * 0.6)
-    
+    try:
+        import cv2
+        import numpy as np
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        best_t = max(1.0, duration * 0.5)
+        best_score = -1.0
+        best_frame = None
+
+        # Sample every 0.12s across the middle 80% of the clip
+        step = max(1, int(fps * 0.12))
+        start_frame = int(fps * 0.8)
+        end_frame = max(start_frame + 1, int(total_frames * 0.95))
+
+        for fno in range(start_frame, end_frame, step):
+            t = fno / fps
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            h, w, _ = frame.shape
+
+            # Focus on center 50% width and 60% height (crosshair & target duel area)
+            center = frame[int(h * 0.20):int(h * 0.80), int(w * 0.25):int(w * 0.75)]
+            hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+
+            # High-saturation and bright enemy models (bright green, yellow, red, cyan)
+            sat = hsv[:, :, 1]
+            val = hsv[:, :, 2]
+            enemy_mask = (sat > 95) & (val > 115)
+            enemy_pixels = int(np.sum(enemy_mask))
+
+            # Edge density (sparks, damage numbers, rail rings, weapon flashes, hit explosions)
+            gray = cv2.cvtColor(center, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 60, 160)
+            edge_pixels = int(np.sum(edges > 0))
+
+            score = (enemy_pixels * 1.8) + edge_pixels
+            if score > best_score:
+                best_score = score
+                best_t = t
+                best_frame = frame
+
+        cap.release()
+
+        if best_frame is not None and best_score > 5000:
+            cv2.imwrite(output_path, best_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            print(f"[Thumbnail] Selected enemy close-up action frame at {best_t:.2f}s (score: {int(best_score)}).")
+            return output_path
+
+    except Exception as e:
+        print("Action thumbnail selection notice:", e)
+
+    # Fallback if scanning fails
+    seek_time = max(1.0, duration * 0.55)
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seek_time:.2f}",
@@ -350,70 +546,656 @@ def extract_action_thumbnail(video_path: str, output_path: str = None) -> str:
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     return output_path
 
-def convert_to_shorts_format(video_path: str, output_path: str = None, style: str = "crop") -> str:
+CHIME_REFS = [
+    os.path.expanduser("~/.local/share/Steam/steamui/sounds/desktop_toast_default.wav.orig"),
+    os.path.expanduser("~/.local/share/Steam/steamui/sounds/desktop_toast_short.wav.orig"),
+    os.path.expanduser("~/.local/share/Steam/steamui/sounds/recording_highlight.wav.orig"),
+    os.path.expanduser("~/.local/share/Steam/steamui/sounds/deck_ui_toast.wav.orig"),
+]
+
+def detect_recording_chime(video_path: str, dur: float, threshold: float = 1200.0, scan_window: float = 1.8):
+    """
+    Scans the trailing end of the video audio (last 1.8s) for Steam Keypad + notification/recording chimes.
+    Returns (t_event, corr_score, ref_name) if a chime is found, else None.
+    """
+    if dur < 2.0:
+        return None
+    start_t = max(0.0, dur - scan_window)
+    wav_path = f"/tmp/chime_check_{os.getpid()}_{int(time.time() * 1000)}.wav"
+    cmd = [
+        "ffmpeg", "-y", "-ss", f"{start_t:.3f}",
+        "-i", video_path,
+        "-vn", "-ac", "2", "-ar", "44100",
+        "-c:a", "pcm_s16le", wav_path
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode != 0 or not os.path.exists(wav_path):
+        return None
+    try:
+        import wave, struct, math
+        with wave.open(wav_path, "rb") as w:
+            n_frames = w.getnframes()
+            if n_frames < 4410:  # at least 0.1s
+                return None
+            samples = struct.unpack(f"<{n_frames * 2}h", w.readframes(n_frames))
+            mono = [(samples[i] + samples[i+1]) / 2.0 for i in range(0, len(samples), 2)]
+            audio_ds = mono[::8]
+
+        detected_events = []
+        for ref_path in CHIME_REFS:
+            if not os.path.exists(ref_path):
+                continue
+            with wave.open(ref_path, "rb") as rw:
+                r_ch = rw.getnchannels()
+                r_sr = rw.getframerate()
+                r_frames = rw.getnframes()
+                r_samples = struct.unpack(f"<{r_frames * r_ch}h", rw.readframes(r_frames))
+                if r_ch == 2:
+                    r_mono = [(r_samples[i] + r_samples[i+1]) / 2.0 for i in range(0, len(r_samples), 2)]
+                else:
+                    r_mono = [float(s) for s in r_samples]
+                r_ds = r_mono[::8]
+                sub_sr = r_sr // 8
+                r_energy = math.sqrt(sum(x * x for x in r_ds)) + 1e-9
+                ref_norm = [x / r_energy for x in r_ds]
+
+            L = len(ref_norm)
+            if len(audio_ds) < L:
+                continue
+            best_corr = 0.0
+            best_idx = 0
+            for i in range(0, len(audio_ds) - L, 4):
+                c = sum(audio_ds[i+j] * ref_norm[j] for j in range(0, L, 4))
+                if abs(c) > best_corr:
+                    best_corr = abs(c)
+                    best_idx = i
+            if best_corr >= threshold:
+                t_event = start_t + (best_idx / sub_sr)
+                detected_events.append((t_event, best_corr, os.path.basename(ref_path)))
+
+        if detected_events:
+            # Return the highest correlation detected event
+            detected_events.sort(key=lambda x: -x[1])
+            return detected_events[0]
+    except Exception as e:
+        print(f"Chime detection warning: {e}")
+    finally:
+        if os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+    return None
+
+def detect_clip_cut_point(video_path: str, player_name: str = "Player", cutoff_delay: float = 0.5, check_chime: bool = True, check_ocr: bool = True) -> tuple:
+    """
+    Analyzes clip using OCR and audio cross-correlation to detect:
+      1. Steam Keypad + recording notification chime (cuts immediately before the chime)
+      2. Player death (Fragged by, Following, You were fragged, You died)
+      3. Round win / completion (wins the round, roundlimit hit, match summary)
+      4. Respawn / scoreboard countdown (Round Begins in, Round starts in, Begins in, Spectators)
+    Regardless of whether the player died or survived the round, cuts the ending
+    right before respawn / new round / scoreboard / chime happens to edit out erroneous footage.
+    Returns:
+      (should_cut: bool, cut_duration: float, total_duration: float, reason: str)
+    """
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return False, 0.0, 0.0, "Could not open clip"
+
+        dur = total_frames / fps
+        if dur < 2.5:
+            cap.release()
+            return False, dur, dur, "Clip very short"
+
+        death_events = []
+        frag_events = []
+        win_events = []
+        respawn_events = []
+
+        if check_ocr:
+            from rapidocr_onnxruntime import RapidOCR
+            engine = RapidOCR()
+            step_frames = max(1, int(fps * 0.4))
+
+            for fno in range(0, total_frames, step_frames):
+                t = fno / fps
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                h, w, _ = frame.shape
+
+                roi = frame[int(h * 0.05):int(h * 0.50), int(w * 0.15):int(w * 0.85)]
+                res, _ = engine(roi)
+                for _, txt, _ in (res or []):
+                    tc = txt.strip()
+                    if re.search(r'fragged\s+by', tc, re.I) or re.search(r'\bfollowing\s+', tc, re.I) or re.search(r'you\s*were\s*fragged', tc, re.I) or re.search(r'you\s*died', tc, re.I):
+                        death_events.append((t, tc))
+                    elif re.search(r'you\s*fragged', tc, re.I):
+                        frag_events.append((t, tc))
+                    elif re.search(r'wins\s+the\s+round', tc, re.I) or re.search(r'roundlimit\s+hit', tc, re.I) or re.search(r'match\s+summary', tc, re.I):
+                        win_events.append((t, tc))
+                    elif re.search(r'round\s*begins\s+in', tc, re.I) or re.search(r'round\s*starts\s+in', tc, re.I) or re.search(r'begins\s+in', tc, re.I) or re.search(r'spectators:', tc, re.I):
+                        respawn_events.append((t, tc))
+
+        cap.release()
+
+        # Determine the initial countdown / warmup phase at the start of the clip
+        initial_countdown_end = 0.0
+        respawn_events.sort(key=lambda x: x[0])
+        if respawn_events and respawn_events[0][0] <= 3.5:
+            last_rc = respawn_events[0][0]
+            for (t, txt) in respawn_events:
+                if t - last_rc <= 2.0:
+                    last_rc = t
+                    initial_countdown_end = t
+                else:
+                    break
+
+        first_win = win_events[0] if win_events else None
+        last_win_t = win_events[-1][0] if win_events else None
+
+        # Filter deaths: ignore stale deaths from earlier round or warmup
+        # Any death before t <= 2.5s is stale text left over from before the clip or pre-round.
+        # Also, if there is a round win event later, any death before that win was not the final action.
+        relevant_death = None
+        for (t, txt) in death_events:
+            if t <= max(2.5, initial_countdown_end + 1.0):
+                continue
+            if any(tf > t + 2.0 for (tf, _) in frag_events):
+                continue
+            if first_win and t < first_win[0]:
+                continue
+            if relevant_death is None or t < relevant_death[0]:
+                relevant_death = (t, txt)
+
+        # Filter respawn countdowns: ignore initial pre-round countdown and any events before death/frags/wins
+        first_respawn = None
+        min_respawn_t = max(10.0, initial_countdown_end + 1.0)
+        if relevant_death:
+            min_respawn_t = max(min_respawn_t, relevant_death[0])
+        if frag_events:
+            min_respawn_t = max(min_respawn_t, max(tf for tf, _ in frag_events))
+        if first_win:
+            min_respawn_t = max(min_respawn_t, first_win[0])
+
+        for (t, txt) in respawn_events:
+            if t < min_respawn_t:
+                continue
+            if first_respawn is None or t < first_respawn[0]:
+                first_respawn = (t, txt)
+
+        cut_t = dur
+        reason = "Full clip"
+        should_cut = False
+
+        if first_win:
+            # Show the win and victory banner / chat reactions, cutting right before the next round's respawn countdown
+            w_cut = max(2.5, min(dur, round(first_win[0] + 3.0, 2)))
+            if first_respawn and first_respawn[0] > first_win[0]:
+                r_cut = max(2.5, min(dur, round(first_respawn[0] - 0.3, 2)))
+                cut_t = min(w_cut, r_cut)
+                reason = f"Round win: {first_win[1]}"
+                should_cut = True
+            else:
+                cut_t = w_cut
+                reason = f"Round win: {first_win[1]}"
+                should_cut = True
+        elif relevant_death:
+            d_cut = max(2.5, min(dur, round(relevant_death[0] + cutoff_delay, 2)))
+            if d_cut < cut_t:
+                cut_t = d_cut
+                reason = f"Player death: {relevant_death[1]}"
+                should_cut = True
+        elif first_respawn:
+            r_cut = max(2.5, min(dur, round(first_respawn[0] - 0.3, 2)))
+            if r_cut < cut_t:
+                cut_t = r_cut
+                reason = f"Respawn countdown: {first_respawn[1]}"
+                should_cut = True
+
+        if check_chime:
+            chime_res = detect_recording_chime(video_path, dur)
+            if chime_res:
+                t_chime, chime_score, chime_name = chime_res
+                chime_cut = max(2.5, round(t_chime - 0.05, 2))
+                if chime_cut < cut_t:
+                    cut_t = chime_cut
+                    reason = f"Recording chime ({chime_name}) at {t_chime:.2f}s"
+                    should_cut = True
+
+        return should_cut, cut_t, dur, reason
+
+    except Exception as e:
+        print(f"Cut detection warning on {video_path}: {e}")
+        return False, 0.0, 0.0, str(e)
+
+# Backward-compatibility alias
+detect_clip_death = detect_clip_cut_point
+
+QUAKE_COLOR_MAP = {
+    '0': '&H000000&',  # Black
+    '1': '&H0000FF&',  # Red
+    '2': '&H00FF00&',  # Green
+    '3': '&H00FFFF&',  # Yellow
+    '4': '&HFF6633&',  # Blue
+    '5': '&HFFFF00&',  # Cyan
+    '6': '&HFF00FF&',  # Magenta / Pink
+    '7': '&HFFFFFF&',  # White
+    '8': '&H0080FF&',  # Orange
+    '9': '&H7F7F7F&',  # Grey
+}
+
+def load_quake_chat_binds() -> dict:
+    cfg_paths = [
+        Path.home() / '.local/share/Steam/steamapps/common/Quake Live/YOUR_STEAM_ID/baseq3/repconfig.cfg',
+        Path.home() / '.local/share/Steam/steamapps/common/Quake Live/YOUR_STEAM_ID/baseq3/autoexec.cfg',
+    ]
+    binds = {}
+    for p in cfg_paths:
+        if p.exists():
+            try:
+                with open(p, 'r', encoding='latin1', errors='ignore') as f:
+                    for line in f:
+                        m = re.search(r'bind\s+\S+\s+\"say(?:_team)?\s+(.+?)\"', line, re.I)
+                        if m:
+                            raw = m.group(1).strip()
+                            clean = re.sub(r'\^[0-9a-zA-Z]', '', raw).strip().lower()
+                            norm = re.sub(r'[^a-zA-Z0-9]', '', clean)
+                            if norm:
+                                binds[norm] = raw
+            except Exception:
+                pass
+    return binds
+
+def enrich_detected_quake_text(raw_ocr_text: str, binds: dict, player_name: str = "Player") -> str:
+    txt = raw_ocr_text.strip()
+    m_player = re.match(r'^(Player)\s*:\s*(.*)', txt, re.I)
+    if m_player:
+        p_name = player_name
+        msg = m_player.group(2).strip()
+        msg_norm = re.sub(r'[^a-zA-Z0-9]', '', msg.lower())
+        if msg_norm in binds:
+            return f"^7{p_name}: {binds[msg_norm]}"
+        for norm_key, raw_bind in binds.items():
+            if norm_key in msg_norm or msg_norm in norm_key:
+                return f"^7{p_name}: {raw_bind}"
+        return f"^7{p_name}: ^7{msg}"
+
+    m_rw = re.search(r'RED\s*TEAM[A-Za-z]?\s+WINS\s+the\s+round!?(.*)', txt, re.I)
+    if m_rw:
+        rem = m_rw.group(1).strip()
+        rem_str = f" ^7{rem}" if rem else ""
+        return f"^1RED TEAM ^3WINS the round!{rem_str}"
+
+    m_bw = re.search(r'BLUE\s*TEAM[A-Za-z]?\s+WINS\s+the\s+round!?(.*)', txt, re.I)
+    if m_bw:
+        rem = m_bw.group(1).strip()
+        rem_str = f" ^7{rem}" if rem else ""
+        return f"^4BLUE TEAM ^3WINS the round!{rem_str}"
+
+    if re.search(r'RED\s+TEAM\s+(leads|wins)', txt, re.I):
+        return f"^1{txt}"
+    if re.search(r'BLUE\s+TEAM\s+(leads|wins)', txt, re.I):
+        return f"^4{txt}"
+    if re.search(r'(round\s+draw|tie\s+match)', txt, re.I):
+        return f"^3{txt}"
+    if re.search(r'fight!?', txt, re.I):
+        return "^1FIGHT!"
+    if re.search(r'round\s+\d+', txt, re.I):
+        return f"^3{txt}"
+
+    m_other = re.match(r'^([A-Za-z0-9_]+)\s*:\s*(.*)', txt)
+    if m_other:
+        return f"^7{m_other.group(1)}: ^7{m_other.group(2)}"
+
+    return f"^7{txt}"
+
+def format_quake_text_to_ass(raw_text: str, max_line_len: int = 36) -> str:
+    """
+    Parses Quake caret color codes (^0 to ^9) and produces an ASS formatted dialogue string.
+    If longer than max_line_len characters, neatly wraps at word boundaries using \\N.
+    Retains active font colors across line breaks, drop shadow, and typography.
+    """
+    chars_with_colors = []
+    current_color = '7'
+    i = 0
+    while i < len(raw_text):
+        if raw_text[i] == '^' and i + 1 < len(raw_text) and raw_text[i+1].isalnum():
+            code = raw_text[i+1].lower()
+            if code in QUAKE_COLOR_MAP:
+                current_color = code
+            i += 2
+        else:
+            chars_with_colors.append((raw_text[i], current_color))
+            i += 1
+
+    if not chars_with_colors:
+        return ''
+
+    plain_text = ''.join(c for c, _ in chars_with_colors)
+
+    lines_char_slices = []
+    if len(plain_text) <= max_line_len:
+        lines_char_slices.append((0, len(plain_text)))
+    else:
+        words = []
+        cur_word_start = 0
+        for idx, (ch, _) in enumerate(chars_with_colors):
+            if ch.isspace():
+                if idx > cur_word_start:
+                    words.append((cur_word_start, idx))
+                cur_word_start = idx + 1
+        if cur_word_start < len(chars_with_colors):
+            words.append((cur_word_start, len(chars_with_colors)))
+
+        line_start = 0
+        last_end = 0
+        for w_start, w_end in words:
+            if last_end == 0:
+                line_start = w_start
+                last_end = w_end
+            elif (w_end - line_start) <= max_line_len:
+                last_end = w_end
+            else:
+                lines_char_slices.append((line_start, last_end))
+                line_start = w_start
+                last_end = w_end
+        if last_end > line_start:
+            lines_char_slices.append((line_start, last_end))
+
+    ass_parts = []
+    active_ass_color = None
+
+    for line_idx, (s_idx, e_idx) in enumerate(lines_char_slices):
+        if line_idx > 0:
+            ass_parts.append(r'\N')
+            active_ass_color = None
+
+        for ch, col in chars_with_colors[s_idx:e_idx]:
+            col_hex = QUAKE_COLOR_MAP.get(col, '&HFFFFFF&')
+            if col_hex != active_ass_color:
+                ass_parts.append(f'{{\\c{col_hex}}}')
+                active_ass_color = col_hex
+            if ch == '{':
+                ass_parts.append(r'\{')
+            elif ch == '}':
+                ass_parts.append(r'\}')
+            elif ch == '\\':
+                ass_parts.append(r'\\')
+            else:
+                ass_parts.append(ch)
+
+    return ''.join(ass_parts)
+
+def generate_chat_subtitles(video_path: str, max_duration: float = None, player_name: str = "Player") -> str:
+    """
+    Scans the lower-left chat and system message region of the video.
+    If chat or round announcements are detected (which would otherwise be cropped
+    out in a 9:16 vertical YouTube Short), generates a temporary ASS subtitle file
+    to display messages with the exact in-game font size, authentic Quake colors,
+    and drop shadow, wrapping longer lines to fit the vertical Shorts format.
+    Returns path to temporary .ass file, or None if no chat text found.
+    """
+    try:
+        import cv2
+        from rapidocr_onnxruntime import RapidOCR
+
+        engine = RapidOCR()
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return None
+
+        dur = total_frames / fps
+        limit_time = min(dur, max_duration) if max_duration else dur
+
+        step_frames = max(1, int(fps * 0.3))
+        detections = []
+        binds = load_quake_chat_binds()
+
+        for fno in range(0, total_frames, step_frames):
+            t = fno / fps
+            if t > limit_time:
+                break
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            h, w, _ = frame.shape
+
+            # Left chat zone (lower-left quadrant)
+            roi = frame[int(h * 0.70):int(h * 0.96), 0:int(w * 0.35)]
+            res, _ = engine(roi)
+
+            # Group items on the same horizontal line
+            lines = []
+            for box, txt, _ in sorted(res or [], key=lambda item: (min(p[1] for p in item[0]), min(p[0] for p in item[0]))):
+                tc = txt.strip()
+                if len(tc) < 2:
+                    continue
+                y_mid = (min(p[1] for p in box) + max(p[1] for p in box)) / 2
+                x_min = min(p[0] for p in box)
+                merged = False
+                for line in lines:
+                    if abs(line['y_mid'] - y_mid) < 25:
+                        line['items'].append((x_min, tc))
+                        merged = True
+                        break
+                if not merged:
+                    lines.append({'y_mid': y_mid, 'items': [(x_min, tc)]})
+
+            for line in lines:
+                line_txt = ' '.join(t for _, t in sorted(line['items'], key=lambda x: x[0])).strip()
+                if len(line_txt) < 3 or line_txt.isdigit() or not re.search(r'[A-Za-z]', line_txt):
+                    continue
+                # Skip spectator list and warmup
+                if re.match(r'^(spectators|warmup)\b', line_txt, re.I):
+                    continue
+                enriched = enrich_detected_quake_text(line_txt, binds, player_name)
+                detections.append((t, enriched))
+
+        cap.release()
+
+        if not detections:
+            return None
+
+        # Group consecutive detections of identical/similar text
+        events = []
+        current_text = None
+        start_t = 0.0
+        last_t = 0.0
+
+        for t, txt in detections:
+            norm_txt = re.sub(r'[^a-zA-Z0-9]', '', txt.lower())
+            if current_text is None:
+                current_text = txt
+                start_t = t
+                last_t = t
+            else:
+                norm_curr = re.sub(r'[^a-zA-Z0-9]', '', current_text.lower())
+                if norm_txt == norm_curr or norm_txt in norm_curr or norm_curr in norm_txt:
+                    last_t = t
+                    if len(txt) > len(current_text):
+                        current_text = txt
+                else:
+                    if last_t - start_t >= 0.2:
+                        events.append((start_t, min(limit_time, max(start_t + 4.5, last_t + 2.5)), current_text))
+                    current_text = txt
+                    start_t = t
+                    last_t = t
+
+        if current_text and (last_t - start_t >= 0.2):
+            events.append((start_t, min(limit_time, max(start_t + 4.5, last_t + 2.5)), current_text))
+
+        if not events:
+            return None
+
+        def format_ass_time(sec: float) -> str:
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = sec % 60
+            return f"{h}:{m:02d}:{s:05.2f}"
+
+        ass_lines = [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "PlayResX: 1440",
+            "PlayResY: 2560",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: Chat, Noto Sans, 84, &H00FFFFFF, &H000000FF, &H00000000, &H80000000, 1, 0, 0, 0, 100, 100, 0, 0, 1, 3, 3, 1, 60, 60, 240, 1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+        ]
+
+        for s_t, e_t, raw_val in events:
+            ass_formatted = format_quake_text_to_ass(raw_val, max_line_len=26)
+            ass_lines.append(f"Dialogue: 0, {format_ass_time(s_t)}, {format_ass_time(e_t)}, Chat, , 60, 60, 240, , {ass_formatted}")
+
+        ass_path = f"/tmp/shorts_chat_{int(time.time() * 1000)}.ass"
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(ass_lines) + "\n")
+
+        print(f"[Chat Overlay] Generated subtitle overlay for {len(events)} chat event(s).")
+        return ass_path
+
+    except Exception as e:
+        print(f"Chat subtitle extraction error on {video_path}: {e}")
+        return None
+
+def convert_to_shorts_format(video_path: str, output_path: str = None, style: str = "crop", max_duration: float = None, subtitles_ass_path: str = None, include_hud: bool = True, target_lufs: float = -15.0, true_peak: float = -1.5) -> str:
     """
     Converts 16:9 gameplay footage into 9:16 vertical YouTube Shorts format.
     Style B ('crop'):
       - 1440x2560 (2K Vertical @ 60FPS) master encode.
       - Lanczos upscaling with unsharp-mask edge sharpening.
       - Encoded via NVENC Preset P7 High Quality at 45-60 Mbps.
+      - Overlays full Health/Armor HUD at bottom & live Red/Blue scores up top (when include_hud=True).
       - Forces YouTube to allocate premium high-bitrate VP09/AV01 1440p codecs.
+    Trims before respawn countdown or player death if max_duration is specified.
+    Displays left-side chat/announcement text at bottom if subtitles_ass_path is specified.
     """
     if not output_path:
         p = Path(video_path)
         output_path = f"/tmp/{p.stem}_shorts_{int(time.time())}.mp4"
 
+    trim_args = ["-t", f"{max_duration:.3f}"] if (max_duration is not None and max_duration > 0) else []
+    # EBU R128 loudness normalization targeting -15 LUFS (comfortable, non-fatiguing volume)
+    # with True Peak limit of -1.5 dBFS to ensure consistent clean audio without distortion
+    af_norm = f"loudnorm=I={target_lufs}:LRA=7:TP={true_peak}"
+    if trim_args and max_duration > 0.5:
+        af_fade = f"afade=t=out:st={max_duration - 0.12:.3f}:d=0.12"
+        audio_args = ["-af", f"{af_norm},{af_fade}", "-c:a", "aac", "-b:a", "256k"]
+    else:
+        audio_args = ["-af", af_norm, "-c:a", "aac", "-b:a", "256k"]
+    ass_filter = f",ass='{subtitles_ass_path}'" if subtitles_ass_path and os.path.exists(subtitles_ass_path) else ""
+
     if style == "crop":
-        vf = "crop=ih*9/16:ih:(iw-ow)/2:0,scale=1440:2560:flags=lanczos,unsharp=5:5:0.6:3:3:0.3,setsar=1"
-        cmd_nvenc = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vf", vf,
-            "-c:v", "h264_nvenc",
-            "-preset", "p7",
-            "-tune", "hq",
-            "-cq", "12",
-            "-b:v", "45M",
-            "-maxrate", "60M",
-            "-c:a", "copy",
-            output_path
-        ]
-        cmd_cpu = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-preset", "slow",
-            "-crf", "16",
-            "-c:a", "copy",
-            output_path
-        ]
+        if include_hud:
+            filter_complex = (
+                "[0:v]crop=ih/2:ih*8/9:(iw-ow)/2:0,scale=1440:2560:flags=bicubic,setsar=1[base];"
+                "[0:v]crop=1000*iw/2560:130*ih/1440:0:10*ih/1440,scale=1200:-1,format=rgba,lumakey=threshold=0.20:tolerance=0.15:softness=0.1,setsar=1[top_scores];"
+                "[0:v]crop=1160*iw/2560:145*ih/1440:700*iw/2560:1290*ih/1440,scale=1400:-1,setsar=1[bottom_hud];"
+                "[base][top_scores]overlay=(W-w)/2:60[v1];"
+                f"[v1][bottom_hud]overlay=(W-w)/2:H-h-25{ass_filter}"
+            )
+            cmd_nvenc = [
+                "ffmpeg", "-y",
+                "-threads", "4",
+                "-i", video_path,
+            ] + trim_args + [
+                "-filter_complex", filter_complex,
+                "-c:v", "h264_nvenc",
+                "-preset", "p5",
+                "-tune", "hq",
+                "-cq", "12",
+                "-b:v", "45M",
+                "-maxrate", "60M",
+            ] + audio_args + [
+                output_path
+            ]
+            cmd_cpu = [
+                "ffmpeg", "-y",
+                "-threads", "4",
+                "-i", video_path,
+            ] + trim_args + [
+                "-filter_complex", filter_complex,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "16",
+            ] + audio_args + [
+                output_path
+            ]
+        else:
+            vf = f"crop=ih*9/16:ih:(iw-ow)/2:0,scale=1440:2560:flags=bicubic,setsar=1{ass_filter}"
+            cmd_nvenc = [
+                "ffmpeg", "-y",
+                "-threads", "4",
+                "-i", video_path,
+            ] + trim_args + [
+                "-vf", vf,
+                "-c:v", "h264_nvenc",
+                "-preset", "p5",
+                "-tune", "hq",
+                "-cq", "12",
+                "-b:v", "45M",
+                "-maxrate", "60M",
+            ] + audio_args + [
+                output_path
+            ]
+            cmd_cpu = [
+                "ffmpeg", "-y",
+                "-threads", "4",
+                "-i", video_path,
+            ] + trim_args + [
+                "-vf", vf,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "16",
+            ] + audio_args + [
+                output_path
+            ]
     else:
         filter_complex = (
             "[0:v]scale=180:320:force_original_aspect_ratio=increase,"
-            "crop=180:320,avgblur=8,scale=1080:1920:flags=lanczos,setsar=1[bg];"
+            "crop=180:320,avgblur=8,scale=1080:1920:flags=bicubic,setsar=1[bg];"
             "[0:v]scale=1080:608,setsar=1[fg];"
-            "[bg][fg]overlay=0:656"
+            f"[bg][fg]overlay=0:656{ass_filter}"
         )
         cmd_nvenc = [
             "ffmpeg", "-y",
+            "-threads", "4",
             "-i", video_path,
+        ] + trim_args + [
             "-filter_complex", filter_complex,
             "-c:v", "h264_nvenc",
-            "-preset", "p7",
+            "-preset", "p5",
             "-tune", "hq",
             "-cq", "14",
-            "-c:a", "copy",
+        ] + audio_args + [
             output_path
         ]
         cmd_cpu = [
             "ffmpeg", "-y",
             "-i", video_path,
+        ] + trim_args + [
             "-filter_complex", filter_complex,
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "18",
-            "-c:a", "copy",
+        ] + audio_args + [
             output_path
         ]
 
@@ -528,8 +1310,8 @@ def get_quake_server_info() -> dict:
 
     return info
 
-def generate_metadata(video_path: str, config: dict, enemy: str = "", weapon: str = "", special_play: str = "", custom_title: str = "", is_shorts: bool = False, server_info: dict = None):
-    player = config.get("player_name", "Player")
+def generate_metadata(video_path: str, config: dict, enemy: str = "", weapon: str = "", special_play: str = "", custom_title: str = "", is_shorts: bool = False, server_info: dict = None, player: str = None, custom_desc: str = ""):
+    player = player or config.get("player_name", "Player")
     dt_str = datetime.now().strftime("%B %d, %Y")
 
     if server_info is None:
@@ -538,11 +1320,17 @@ def generate_metadata(video_path: str, config: dict, enemy: str = "", weapon: st
         except Exception:
             server_info = {}
 
+    has_multiple_enemies = " & " in enemy
+
     if custom_title:
         title = custom_title
     elif special_play and special_play in TEMPLATES_SPECIAL_FEATS:
         title = random.choice(TEMPLATES_SPECIAL_FEATS[special_play]).format(
             player=player, enemy=enemy or "OPPONENTS", weapon=(weapon or "RAILGUN").upper()
+        )
+    elif has_multiple_enemies:
+        title = random.choice(TEMPLATES_TWO_FRAGS_GENERIC).format(
+            player=player, enemy=enemy, weapon=(weapon or "RAILGUN").upper()
         )
     elif enemy and weapon:
         title = random.choice(TEMPLATES_WITH_ENEMY_AND_WEAPON).format(
@@ -559,42 +1347,57 @@ def generate_metadata(video_path: str, config: dict, enemy: str = "", weapon: st
     else:
         title = random.choice(TEMPLATES_GENERAL).format(player=player)
 
-    if is_shorts:
-        if "#Shorts" not in title and "#shorts" not in title:
-            if len(title) + 8 <= 100:
-                title = f"{title} #Shorts"
+    # Protect player and enemy names from being cut off if title exceeds 100 characters
+    max_len = 92 if (is_shorts and "#Shorts" not in title and "#shorts" not in title) else 100
+    if len(title) > max_len:
+        # If names are at the end ('player vs enemy' or 'player'), preserve them fully
+        names_suffix = f"{player} vs {enemy}" if enemy else player
+        if title.endswith(names_suffix):
+            allowed_prefix_len = max_len - len(names_suffix) - 1
+            if allowed_prefix_len > 10:
+                prefix = title[:-len(names_suffix)].rstrip(" :!-–")
+                title = f"{prefix[:allowed_prefix_len].rstrip()} {names_suffix}"
             else:
-                title = f"{title[:91]} #Shorts"
+                title = title[:max_len]
+        else:
+            title = title[:max_len]
 
-    frag_details = []
-    if special_play and special_play != "Auto / Standard Frag":
-        frag_details.append(f"🔥 Highlight Play: {special_play}")
-    if enemy:
-        frag_details.append(f"🎯 Target Eliminated: {enemy}")
-    if weapon:
-        frag_details.append(f"💥 Weapon Used: {weapon}")
+    if is_shorts and "#Shorts" not in title and "#shorts" not in title:
+        title = f"{title} #Shorts"
 
-    frag_section = "\n".join(frag_details) + "\n\n" if frag_details else "GGs in the chat!\n\n"
-    shorts_footer = "\n\n#Shorts #QuakeLive #Gaming #FPS #Clip" if is_shorts else ""
+    if custom_desc:
+        description = custom_desc
+    else:
+        frag_details = []
+        if special_play and special_play != "Auto / Standard Frag":
+            frag_details.append(f"🔥 Highlight Play: {special_play}")
+        if enemy:
+            target_label = "🎯 Targets Eliminated" if has_multiple_enemies else "🎯 Target Eliminated"
+            frag_details.append(f"{target_label}: {enemy}")
+        if weapon:
+            frag_details.append(f"💥 Weapon Used: {weapon}")
 
-    server_section = []
-    if server_info.get("server_name"):
-        server_section.append(f"🌐 Server: {server_info['server_name']}")
-    if server_info.get("server_ip"):
-        server_section.append(f"🔌 Server IP: {server_info['server_ip']}")
-    if server_info.get("map_name"):
-        server_section.append(f"🗺️ Map: {server_info['map_name']}")
-    if server_info.get("game_mode"):
-        server_section.append(f"🏆 Mode: {server_info['game_mode']}")
-    if server_info.get("players"):
-        lobby_str = ", ".join(server_info["players"][:12])
-        if len(server_info["players"]) > 12:
-            lobby_str += f" (+{len(server_info['players']) - 12} more)"
-        server_section.append(f"👥 Lobby Players: {lobby_str}")
+        frag_section = "\n".join(frag_details) + "\n\n" if frag_details else "GGs in the chat!\n\n"
+        shorts_footer = "\n\n#Shorts #QuakeLive #Gaming #FPS #Clip" if is_shorts else ""
 
-    server_block = "\n".join(server_section) + "\n" if server_section else ""
+        server_section = []
+        if server_info.get("server_name"):
+            server_section.append(f"🌐 Server: {server_info['server_name']}")
+        if server_info.get("server_ip"):
+            server_section.append(f"🔌 Server IP: {server_info['server_ip']}")
+        if server_info.get("map_name"):
+            server_section.append(f"🗺️ Map: {server_info['map_name']}")
+        if server_info.get("game_mode"):
+            server_section.append(f"🏆 Mode: {server_info['game_mode']}")
+        if server_info.get("players"):
+            lobby_str = ", ".join(server_info["players"][:12])
+            if len(server_info["players"]) > 12:
+                lobby_str += f" (+{len(server_info['players']) - 12} more)"
+            server_section.append(f"👥 Lobby Players: {lobby_str}")
 
-    description = f"""{title}
+        server_block = "\n".join(server_section) + "\n" if server_section else ""
+
+        description = f"""{title}
 
 {player} bringing the heat in Quake Live!
 {frag_section}🎮 Game: Quake Live
@@ -606,6 +1409,20 @@ Drop a like and subscribe for more Quake Live highlights and arena frags! 🔥
 
 #QuakeLive #Quake #AFPS #FragClip #Gaming #PCGaming #RocketJump #Railgun #FPS #CompetitiveGaming{shorts_footer}"""
 
+    enemy_tags = []
+    if enemy:
+        enemy_tags.append(enemy)
+        if " & " in enemy:
+            for en in enemy.split(" & "):
+                if en.strip():
+                    enemy_tags.append(en.strip())
+            enemy_tags.extend(["Two Frags", "Double Kill"])
+
+    player_tags = [player]
+    if "(" in player and ")" in player:
+        cleaned_pts = player.replace("(", " ").replace(")", " ").split()
+        player_tags.extend(cleaned_pts)
+
     extra_tags = ["Shorts", "YouTube Shorts", "#Shorts"] if is_shorts else []
     server_tags = []
     if server_info.get("server_name"):
@@ -613,9 +1430,9 @@ Drop a like and subscribe for more Quake Live highlights and arena frags! 🔥
     if server_info.get("map_name"):
         server_tags.append(server_info["map_name"])
 
-    tags = list(set(config.get("tags", []) + [
-        player, "Quake Live", "Quake", "Arena FPS", "Fragmovie", "Gameplay", "Clutch"
-    ] + ([enemy] if enemy else []) + ([weapon] if weapon else []) + ([special_play] if special_play else []) + extra_tags + server_tags))
+    tags = list(set(config.get("tags", []) + player_tags + [
+        "Quake Live", "Quake", "Arena FPS", "Fragmovie", "Gameplay", "Clutch"
+    ] + enemy_tags + ([weapon] if weapon else []) + ([special_play] if special_play else []) + extra_tags + server_tags))
 
     return title, description, tags
 
@@ -789,13 +1606,29 @@ def _execute_video_upload(youtube, file_path: str, title: str, description: str,
 
     return video_id, video_url
 
-def upload_video(video_path: str, enemy: str = None, weapon: str = None, special_play: str = None, custom_title: str = None, prompt: bool = False, shorts: bool = None, shorts_style: str = None, dual_upload: bool = None):
+def upload_video(video_path: str, enemy: str = None, weapon: str = None, special_play: str = None, custom_title: str = None, prompt: bool = False, shorts: bool = None, shorts_style: str = None, dual_upload: bool = None, cut_on_death: bool = None, include_hud: bool = None, player: str = None, custom_desc: str = None):
     if not os.path.exists(video_path):
         notify("Upload Failed", f"File not found: {video_path}", icon="dialog-error")
         return
 
     config = load_config()
-    player_name = config.get("player_name", "Player")
+
+    stem = Path(video_path).stem
+    overrides = {}
+    if OVERRIDES_FILE.exists():
+        try:
+            with open(OVERRIDES_FILE, "r") as f:
+                all_overrides = json.load(f)
+                overrides = all_overrides.get(stem, {})
+        except Exception as e:
+            print("Error loading clip overrides:", e)
+
+    player_name = player or overrides.get("player") or config.get("player_name", "Player")
+    enemy = enemy or overrides.get("enemy")
+    weapon = weapon or overrides.get("weapon")
+    special_play = special_play or overrides.get("special_play")
+    custom_title = custom_title or overrides.get("custom_title")
+    custom_desc = custom_desc or overrides.get("custom_desc")
 
     if prompt:
         e, w, s, c = prompt_frag_details(video_path, player_name)
@@ -806,7 +1639,7 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         weapon = w or weapon or ""
         special_play = s or special_play or ""
         custom_title = c or custom_title or ""
-    else:
+    elif not enemy or not weapon:
         # Zero-input mode: automatically analyze video footage
         notify("🔍 Analyzing Video...", f"{Path(video_path).name}\nDetecting enemy frags & weapons...", icon="video-x-generic", expire_ms=3000)
         auto_data = analyze_video_gameplay(video_path)
@@ -825,10 +1658,36 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
     except Exception:
         pass
 
+    # Ending cut calculation (stops before player respawn, post-round scoreboard, or recording chime)
+    should_cut = cut_on_death if cut_on_death is not None else config.get("cut_before_respawn", config.get("cut_on_death", True))
+    cut_chime_enabled = config.get("cut_recording_chime", True)
+    cutoff_delay = float(config.get("death_cutoff_delay", 0.5))
+
+    cut_duration = None
+    cut_reason = None
+    if should_cut or cut_chime_enabled:
+        has_cut, cut_t, total_d, reason = detect_clip_cut_point(
+            video_path,
+            player_name=player_name,
+            cutoff_delay=cutoff_delay,
+            check_chime=cut_chime_enabled,
+            check_ocr=should_cut
+        )
+        if has_cut and cut_t < dur - 0.1:
+            cut_duration = cut_t
+            cut_reason = reason
+            print(f"[Clip Cut] Ending trimmed to {cut_duration:.2f}s ({reason}) to cut out erroneous post-round/respawn/chime footage.")
+
     # Shorts decision: if shorts is True, or if shorts is None and shorts_mode config is True and dur <= 60s
     is_shorts = (shorts is True) or (shorts is None and config.get("shorts_mode", True) and dur <= 60.0)
     shorts_style = shorts_style or config.get("shorts_style", "crop")
     should_dual = dual_upload if dual_upload is not None else config.get("dual_upload", True)
+    should_include_hud = include_hud if include_hud is not None else config.get("include_hud_overlays", True)
+
+    # Left-side chat & announcements subtitle overlay
+    subtitles_ass = None
+    if is_shorts and config.get("display_left_chat", True):
+        subtitles_ass = generate_chat_subtitles(video_path, max_duration=cut_duration, player_name=player_name)
 
     # Check credentials
     if not TOKEN_FILE.exists() and not CLIENT_SECRETS_FILE.exists():
@@ -849,16 +1708,29 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
     if is_shorts:
         # 1. Upload Vertical YouTube Short
         style_desc = "full-screen vertical trim" if shorts_style == "crop" else "blurred background"
-        notify("📱 Creating YouTube Short (9:16)...", f"{Path(video_path).name}\nFormatting {style_desc} with NVENC...", icon="video-x-generic", expire_ms=3000)
+        cut_notice = f"\nStopping at {cut_duration:.1f}s (cut before respawn)" if cut_duration else ""
+        chat_notice = "\nChat text displayed at bottom" if subtitles_ass else ""
+        hud_notice = "\nHUD (Scores & Health/Armor) included" if should_include_hud else ""
+        notify("📱 Creating YouTube Short (9:16)...", f"{Path(video_path).name}{cut_notice}{chat_notice}{hud_notice}\nFormatting {style_desc} with NVENC...", icon="video-x-generic", expire_ms=3500)
         
         shorts_target = None
+        target_lufs = float(config.get("audio_loudness_i", -15.0))
+        target_tp = float(config.get("audio_true_peak", -1.5))
         try:
-            shorts_target = convert_to_shorts_format(video_path, style=shorts_style)
+            shorts_target = convert_to_shorts_format(
+                video_path,
+                style=shorts_style,
+                max_duration=cut_duration,
+                subtitles_ass_path=subtitles_ass,
+                include_hud=should_include_hud,
+                target_lufs=target_lufs,
+                true_peak=target_tp
+            )
         except Exception as e:
             print("Shorts conversion failed:", e)
 
         if shorts_target and os.path.exists(shorts_target):
-            s_title, s_desc, s_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=True, server_info=server_info)
+            s_title, s_desc, s_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=True, server_info=server_info, player=player_name, custom_desc=custom_desc)
             detail_line = f"Target: {enemy} | Weapon: {weapon}" if enemy else f"Weapon: {weapon}"
             notify("⏳ Uploading YouTube Short...", f"{s_title}\n{detail_line}\nVisibility: {privacy.upper()}", icon="emblem-synchronizing", expire_ms=4000)
             
@@ -879,10 +1751,16 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
                 except Exception:
                     pass
 
+        if subtitles_ass and os.path.exists(subtitles_ass):
+            try:
+                os.remove(subtitles_ass)
+            except Exception:
+                pass
+
         # 2. Dual upload: Also upload the original 16:9 widescreen 1440p version
         if should_dual:
             notify("🖥️ Uploading 1440p Widescreen Version...", f"Original 2560x1440 60FPS for {Path(video_path).name}...", icon="emblem-synchronizing", expire_ms=4000)
-            w_title, w_desc, w_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=False, server_info=server_info)
+            w_title, w_desc, w_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=False, server_info=server_info, player=player_name, custom_desc=custom_desc)
             
             w_thumb = None
             try:
@@ -896,7 +1774,7 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
 
     else:
         # Standard Widescreen 16:9 Upload only
-        w_title, w_desc, w_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=False, server_info=server_info)
+        w_title, w_desc, w_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=False, server_info=server_info, player=player_name, custom_desc=custom_desc)
         detail_line = f"Target: {enemy} | Weapon: {weapon}" if enemy else f"Weapon: {weapon}"
         notify("⏳ Uploading Video to YouTube...", f"{w_title}\n{detail_line}\nVisibility: {privacy.upper()}", icon="emblem-synchronizing", expire_ms=5000)
 
@@ -918,11 +1796,26 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         except Exception:
             pass
 
+        # Move uploaded video to 'uploaded' subfolder
+        dest_moved_path = None
+        try:
+            v_orig = Path(video_path).resolve()
+            if v_orig.is_file() and v_orig.parent.name != "uploaded":
+                dest_dir = v_orig.parent / "uploaded"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest_target = dest_dir / v_orig.name
+                shutil.move(str(v_orig), str(dest_target))
+                dest_moved_path = dest_target
+                print(f"Moved uploaded video to subfolder: {dest_target}")
+        except Exception as move_err:
+            print(f"Notice: Could not move uploaded video: {move_err}")
+
         subprocess.Popen(["pw-play", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subfolder_note = f"\nMoved clip to: {dest_moved_path.parent.name}/" if dest_moved_path else ""
         if len(uploaded_links) > 1:
-            notify("✅ Dual YouTube Upload Complete! (PUBLIC)", f"📱 Short: {uploaded_links[0]}\n🖥️ 1440p: {uploaded_links[1]}", icon="dialog-ok", expire_ms=8000)
+            notify("✅ Dual YouTube Upload Complete! (PUBLIC)", f"📱 Short: {uploaded_links[0]}\n🖥️ 1440p: {uploaded_links[1]}{subfolder_note}", icon="dialog-ok", expire_ms=8000)
         else:
-            notify("✅ YouTube Upload Complete! (PUBLIC)", f"Link copied: {primary_link}", icon="dialog-ok", expire_ms=7000)
+            notify("✅ YouTube Upload Complete! (PUBLIC)", f"Link copied: {primary_link}{subfolder_note}", icon="dialog-ok", expire_ms=7000)
 
 if __name__ == "__main__":
     import argparse
@@ -932,12 +1825,18 @@ if __name__ == "__main__":
     parser.add_argument("--weapon", default=None, help="Weapon used")
     parser.add_argument("--feat", default=None, help="Special feat / highlight")
     parser.add_argument("--title", default=None, help="Custom YouTube title")
+    parser.add_argument("--player", default=None, help="POV player name (default from config: Player)")
+    parser.add_argument("--desc", default=None, help="Custom YouTube description")
     parser.add_argument("--prompt", "--manual", action="store_true", help="Prompt interactive GUI dialog instead of auto-analyzing")
     parser.add_argument("--shorts", action="store_true", default=None, help="Force formatting and uploading as a 9:16 vertical YouTube Short")
     parser.add_argument("--horizontal", "--widescreen", dest="shorts", action="store_false", help="Force 16:9 widescreen upload instead of Short")
     parser.add_argument("--shorts-style", choices=["crop", "blur"], default=None, help="Shorts layout: 'crop' (full vertical trim) or 'blur' (blurred background)")
     parser.add_argument("--dual", dest="dual_upload", action="store_true", default=None, help="Upload both 9:16 Short and 16:9 widescreen versions")
     parser.add_argument("--no-dual", dest="dual_upload", action="store_false", help="Upload only one version")
+    parser.add_argument("--cut-on-death", "--cut-respawn", "--cut-before-respawn", dest="cut_on_death", action="store_true", default=None, help="Stop video before respawn/scoreboard (whether died or survived)")
+    parser.add_argument("--no-cut-on-death", "--no-cut-respawn", dest="cut_on_death", action="store_false", help="Do not cut video before respawn")
+    parser.add_argument("--include-hud", dest="include_hud", action="store_true", default=None, help="Include top scores and full bottom Health/Armor HUD overlay")
+    parser.add_argument("--no-include-hud", dest="include_hud", action="store_false", help="Do not overlay HUD elements")
     args = parser.parse_args()
 
     upload_video(
@@ -949,5 +1848,9 @@ if __name__ == "__main__":
         prompt=args.prompt,
         shorts=args.shorts,
         shorts_style=args.shorts_style,
-        dual_upload=args.dual_upload
+        dual_upload=args.dual_upload,
+        cut_on_death=args.cut_on_death,
+        include_hud=args.include_hud,
+        player=args.player,
+        custom_desc=args.desc
     )
