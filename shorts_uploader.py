@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 
 # Ensure site-packages with cv2, rapidocr_onnxruntime, etc. are available
 dictate_site = os.path.expanduser("~/.local/share/dictate-env/lib/python3.14/site-packages")
@@ -105,6 +106,11 @@ TEMPLATES_SPECIAL_FEATS = {
         "4 SHOTS, 6 RAILS! UNREAL COLLATERALS 💀🔥 {player} vs {enemy}",
         "DOUBLE COLLATERAL RAILGUN STREAK! 🎯⚡ {player} vs {enemy}"
     ],
+    "3 Rails in a Row": [
+        "3 RAILS IN A ROW! SURGICAL ACCURACY 🎯⚡ {player} vs {enemy}",
+        "3 RAILS IN A ROW & HEADSHOT FINISH! 🎯💀 {player} vs {enemy}",
+        "GOD-TIER ACCURACY! 3 RAILS IN A ROW 🎯🔥 {player} vs {enemy}"
+    ],
     "Double Rail / Collateral": [
         "DOUBLE RAIL COLLATERAL! 🎯💥 {player} vs {enemy}",
         "ONE SHOT, TWO KILLS! DOUBLE RAIL 💀⚡ {player} vs {enemy}",
@@ -155,9 +161,14 @@ def load_config():
         "cut_before_respawn": True,  # Cut ending right before respawn countdown / scoreboard happens
         "cut_recording_chime": True, # Automatically detect and cut Steam Keypad + recording notification chime
         "display_left_chat": True,   # Display left-side chat and announcements at bottom of Shorts
-        "death_cutoff_delay": 0.5,   # Extra seconds after death message to show fatal hit
+        "death_cutoff_delay": 1.2,   # Extra seconds after death message to show fatal hit and comments
         "audio_loudness_i": -15.0,   # Integrated loudness target (LUFS)
         "audio_true_peak": -1.5,     # True peak ceiling (dBFS)
+        "action_slowmo": True,       # Slow down and zoom in on action climax to extend excitement
+        "action_slowmo_speed": 0.25, # Slow motion speed multiplier (0.25 = 4x slow motion)
+        "action_zoom": True,         # Zoom in dynamically on the combat/frag action
+        "action_emojis": True,       # Overlay fitting emojis and highlight banner
+        "action_excitement_audio": True, # Layer iconic Quake announcer & impact audio
         "tags": ["Quake Live", "Quake", "FPS", "Gameplay", "Steam Recording"]
     }
     if CONFIG_FILE.exists():
@@ -173,11 +184,12 @@ IGNORE_WORDS = {
     'courtyard 2nd', 'shotgun', 'railgun', 'rocket stairwell', 'hyway', 'red team', 'blue team',
     'fight!', 'fight', 'round begins in', 'round', 'begins', 'fog pit', 'upper cou', 'hallway',
     'fps', '250fps', '250f', 'mega', 'quad', 'stairs', 'the', 'and', 'red', 'blue', 'draw',
-    'k/d', 'score', 'ping', 'time', 'dmg', 'acc', 'lead', 'tied', 'red wins the round',
-    'matchinprogress', 'players', 'community server', 'community server - overkill',
-    'player stats', 'player', 'dmg weap', 'item to use', 'no item to use', 'item to u',
+    'k/d', 'score', 'score k/d', 'score k', 'teams are tied', 'ping', 'time', 'dmg', 'acc', 'lead', 'tied',
+    'red wins the round', 'matchinprogress', 'players', 'community server', 'community server - overkill',
+    'player stats', 'player', 'player (6/6)', 'dmg weap', 'item to use', 'no item to use', 'item to u',
     'dead and gone', 'dead and', 'community server - dead and gone', 'community server - aerowalk',
-    'aerowalk', 'verticalvengeance', 'overkill', '12players', 'veap', 'the last s', 'last s'
+    'aerowalk', 'verticalvengeance', 'overkill', '12players', 'veap', 'the last s', 'last s',
+    'grinder', 'beams', 'blood run', 'the last standing'
 }
 
 def clean_player_name(raw: str, server_players: list = None) -> str:
@@ -186,8 +198,22 @@ def clean_player_name(raw: str, server_players: list = None) -> str:
     s = re.sub(r'^(red|blue)\s+team\s*', '', s, flags=re.I)
     s = re.sub(r'^\d+/\d+$', '', s)
     s = re.sub(r'^\d+:\d+$', '', s)
-    s = re.sub(r'^[^\w\u4e00-\u9fff™]+|[^\w\u4e00-\u9fff™]+$', '', s)
-    if s.lower() in IGNORE_WORDS or s.isdigit():
+    # Explicitly preserve valid Quake symbol gamer tags like '^'
+    if s.rstrip('.') == '^':
+        return '^'
+    # Reject scoreboard table headers and UI indicators
+    if re.search(r'\b(score\s*k/?d|k/?d|dmg\s*weap|player\s*\(\d+/\d+\))\b', s, re.I):
+        return ''
+    if 'score' in s.lower() and ('k' in s.lower() or 'd' in s.lower()):
+        return ''
+    if s.lower().startswith('player') and ('(' in s or '/' in s or 'stats' in s.lower()):
+        return ''
+    s = re.sub(r'^[^\w\u4e00-\u9fff™\^]+|[^\w\u4e00-\u9fff™\^]+$', '', s)
+    if s == '^':
+        return '^'
+    if not s or s.lower() in IGNORE_WORDS or s.isdigit():
+        return ''
+    if re.search(r'\b(score\s+k/?d|k/?d|dmg\s+weap|player\s*\(\d+/\d+\))\b', s, re.I):
         return ''
     if re.match(r'^\d+(\.\d+)?[kK]$', s) or re.match(r'^\d+dmg$', s, re.I):
         return ''
@@ -239,6 +265,8 @@ def analyze_video_gameplay(video_path: str) -> dict:
         frag_weapons = Counter()
         weapon_scores = Counter()
         has_double_rail = False
+        has_triple_rail = False
+        rail_hit_count = 0
         has_air_rocket_medal = False
         has_excellent_medal = False
         is_telefrag = False
@@ -295,7 +323,7 @@ def analyze_video_gameplay(video_path: str) -> dict:
                     has_excellent_medal = True
                 if re.search(r'match\s*summary', t, re.I) or re.search(r'roundlimit', t, re.I) or re.search(r'wins\s+by\s+a\s+score', t, re.I) or re.search(r'wins\s+the\s+round', t, re.I):
                     is_game_ending = True
-                m = re.search(r'(?:you\s*)?fragged\s+([A-Za-z0-9_\u4e00-\u9fff™\.\-]+)', t, re.I)
+                m = re.search(r'(?:you\s*)?fragged\s+([A-Za-z0-9_\u4e00-\u9fff™\.\-\^]+)', t, re.I)
                 if m:
                     cn = clean_player_name(m.group(1), server_players)
                     if cn:
@@ -314,7 +342,7 @@ def analyze_video_gameplay(video_path: str) -> dict:
                     player_died = True
                 if re.search(r'telefrag', t, re.I):
                     is_telefrag = True
-                m = re.search(r'aol[_\.\s]+\s*([A-Za-z0-9_\u4e00-\u9fff™\.\-]+)', t, re.I)
+                m = re.search(r'aol[_\.\s]+\s*([A-Za-z0-9_\u4e00-\u9fff™\.\-\^]+)', t, re.I)
                 if m:
                     cn = clean_player_name(m.group(1), server_players)
                     if cn:
@@ -328,16 +356,14 @@ def analyze_video_gameplay(video_path: str) -> dict:
                     if cv2.countNonZero(m_red1 | m_red2) > 80:
                         is_telefrag = True
 
-            # 3. Quake Live Medals at top-center (Midair wreath, Excellent yellow skull with wings)
+            # 3. Quake Live Medals at top-center (Midair wreath)
+            # Note: Medal detection strictly requires verified OCR text to prevent false positives from loose HSV masks
             award_roi = frame[int(h * 0.05):int(h * 0.22), int(w * 0.40):int(w * 0.60)]
             hsv_award = cv2.cvtColor(award_roi, cv2.COLOR_BGR2HSV)
             mask_wreath = cv2.inRange(hsv_award, (40, 100, 100), (85, 255, 255))
             mask_wings = cv2.inRange(hsv_award, (0, 0, 200), (180, 50, 255))
             if cv2.countNonZero(mask_wreath) > 25 and cv2.countNonZero(mask_wings) > 15:
                 has_air_rocket_medal = True
-            mask_gold = cv2.inRange(hsv_award, (18, 110, 110), (36, 255, 255))
-            if cv2.countNonZero(mask_gold) > 40:
-                has_excellent_medal = True
 
             # 4. Center combat zone for damage numbers, medals, and target overhead nameplates
             center_roi = frame[int(h * 0.25):int(h * 0.75), int(w * 0.25):int(w * 0.75)]
@@ -356,9 +382,13 @@ def analyze_video_gameplay(video_path: str) -> dict:
                     is_game_ending = True
                 if t.isdigit() and int(t) in range(15, 120):
                     frame_damage = True
-                elif "80" in t and len(t) >= 4:
+                    if t == "80":
+                        rail_hit_count += 1
+                elif "80" in t:
                     frame_damage = True
-                    has_double_rail = True
+                    rail_hit_count += 1
+                    if len(t) >= 4:
+                        has_double_rail = True
                 else:
                     cn = clean_player_name(t, server_players)
                     if cn:
@@ -406,6 +436,11 @@ def analyze_video_gameplay(video_path: str) -> dict:
         if player_died:
             is_game_ending = False
 
+        if rail_hit_count >= 3:
+            has_triple_rail = True
+        elif rail_hit_count >= 2:
+            has_double_rail = True
+
         feat = ""
         if is_telefrag:
             wep = "Telefrag"
@@ -416,6 +451,8 @@ def analyze_video_gameplay(video_path: str) -> dict:
             feat = "Two Frags in Two Seconds"
         elif wep == "Rocket Launcher" and has_air_rocket_medal and not player_died:
             feat = "Air Rocket / Direct"
+        elif wep == "Railgun" and has_triple_rail and not player_died:
+            feat = "3 Rails in a Row"
         elif wep == "Railgun" and has_double_rail and not player_died:
             feat = "Back-to-Back Double Rails"
         elif wep == "Gauntlet" and has_humiliation:
@@ -441,7 +478,7 @@ def prompt_frag_details(video_path: str, player_name: str = "Player"):
         "--add-combo=Weapon Used",
         "--combo-values=Railgun|Rocket Launcher|Lightning Gun|Shotgun|Gauntlet|Plasma Gun|Grenade Launcher|BFG",
         "--add-combo=Special Highlight / Feat",
-        "--combo-values=Auto / Standard Frag|Two Frags in Two Seconds|Round-Ending Frag|Round-Ending Telefrag|Back-to-Back Double Rails|Double Rail / Collateral|Air Rocket / Direct|Midair Railgun|Clutch / Wipeout",
+        "--combo-values=Auto / Standard Frag|3 Rails in a Row|Two Frags in Two Seconds|Round-Ending Frag|Round-Ending Telefrag|Back-to-Back Double Rails|Double Rail / Collateral|Air Rocket / Direct|Midair Railgun|Clutch / Wipeout",
         "--add-entry=Custom Title Override (optional)",
         "--ok-label=Export & Upload",
         "--cancel-label=Cancel",
@@ -699,8 +736,13 @@ def detect_clip_cut_point(video_path: str, player_name: str = "Player", cutoff_d
                 else:
                     break
 
-        first_win = win_events[0] if win_events else None
-        last_win_t = win_events[-1][0] if win_events else None
+        # Filter win events: ignore stale wins if frags occur later!
+        relevant_win = None
+        for (t, txt) in win_events:
+            if any(tf > t + 1.5 for (tf, _) in frag_events):
+                continue
+            if relevant_win is None or t < relevant_win[0]:
+                relevant_win = (t, txt)
 
         # Filter deaths: ignore stale deaths from earlier round or warmup
         # Any death before t <= 2.5s is stale text left over from before the clip or pre-round.
@@ -711,7 +753,7 @@ def detect_clip_cut_point(video_path: str, player_name: str = "Player", cutoff_d
                 continue
             if any(tf > t + 2.0 for (tf, _) in frag_events):
                 continue
-            if first_win and t < first_win[0]:
+            if relevant_win and t < relevant_win[0]:
                 continue
             if relevant_death is None or t < relevant_death[0]:
                 relevant_death = (t, txt)
@@ -723,8 +765,8 @@ def detect_clip_cut_point(video_path: str, player_name: str = "Player", cutoff_d
             min_respawn_t = max(min_respawn_t, relevant_death[0])
         if frag_events:
             min_respawn_t = max(min_respawn_t, max(tf for tf, _ in frag_events))
-        if first_win:
-            min_respawn_t = max(min_respawn_t, first_win[0])
+        if relevant_win:
+            min_respawn_t = max(min_respawn_t, relevant_win[0])
 
         for (t, txt) in respawn_events:
             if t < min_respawn_t:
@@ -736,27 +778,32 @@ def detect_clip_cut_point(video_path: str, player_name: str = "Player", cutoff_d
         reason = "Full clip"
         should_cut = False
 
-        if first_win:
-            # Show the win and victory banner / chat reactions, cutting right before the next round's respawn countdown
-            w_cut = max(2.5, min(dur, round(first_win[0] + 3.0, 2)))
-            if first_respawn and first_respawn[0] > first_win[0]:
-                r_cut = max(2.5, min(dur, round(first_respawn[0] - 0.3, 2)))
+        # Keep at least 1.2s (or configured death_cutoff_delay) after death / action / round win to see chat comments
+        effective_delay = max(1.2, float(cutoff_delay))
+
+        if relevant_win:
+            # Show the win and victory banner / chat reactions, keeping at least 3.5-4.0s after the win
+            w_cut = max(2.5, min(dur, round(relevant_win[0] + max(3.5, effective_delay + 2.0), 2)))
+            if first_respawn and first_respawn[0] > relevant_win[0]:
+                r_cut = max(2.5, min(dur, round(max(first_respawn[0] - 0.2, relevant_win[0] + effective_delay), 2)))
                 cut_t = min(w_cut, r_cut)
-                reason = f"Round win: {first_win[1]}"
+                reason = f"Round win: {relevant_win[1]}"
                 should_cut = True
             else:
                 cut_t = w_cut
-                reason = f"Round win: {first_win[1]}"
+                reason = f"Round win: {relevant_win[1]}"
                 should_cut = True
         elif relevant_death:
-            d_cut = max(2.5, min(dur, round(relevant_death[0] + cutoff_delay, 2)))
+            d_cut = max(2.5, min(dur, round(relevant_death[0] + effective_delay, 2)))
             if d_cut < cut_t:
                 cut_t = d_cut
                 reason = f"Player death: {relevant_death[1]}"
                 should_cut = True
         elif first_respawn:
-            r_cut = max(2.5, min(dur, round(first_respawn[0] - 0.3, 2)))
-            if r_cut < cut_t:
+            last_frag_t = max([tf for (tf, _) in frag_events], default=0.0)
+            min_post_action = last_frag_t + effective_delay
+            r_cut = max(2.5, min(dur, round(max(first_respawn[0] - 0.2, min_post_action), 2)))
+            if r_cut < cut_t and r_cut < dur - 0.2:
                 cut_t = r_cut
                 reason = f"Respawn countdown: {first_respawn[1]}"
                 should_cut = True
@@ -815,19 +862,54 @@ def load_quake_chat_binds() -> dict:
                 pass
     return binds
 
-def enrich_detected_quake_text(raw_ocr_text: str, binds: dict, player_name: str = "Player") -> str:
+def detect_crop_quake_color(crop) -> str:
+    """
+    Analyzes pixel HSV values in a cropped text region from Quake Live
+    and maps the dominant text color to Quake color code ('0'-'9').
+    """
+    if crop is None or crop.size == 0:
+        return "7"
+    import cv2
+    import numpy as np
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2]
+    s = hsv[:, :, 1]
+    h = hsv[:, :, 0]
+    mask = v > 65
+    if np.sum(mask) < 5:
+        return "7"
+    s_vals = s[mask]
+    h_vals = h[mask]
+    if np.median(s_vals) < 40:
+        return "7"
+    med_h = np.median(h_vals)
+    if med_h <= 12 or med_h >= 165:
+        return "1"  # Red
+    elif 13 <= med_h <= 34:
+        return "3"  # Yellow
+    elif 35 <= med_h <= 85:
+        return "2"  # Green
+    elif 86 <= med_h <= 105:
+        return "5"  # Cyan
+    elif 106 <= med_h <= 135:
+        return "4"  # Blue
+    elif 136 <= med_h <= 164:
+        return "6"  # Magenta
+    return "7"
+
+def enrich_detected_quake_text(raw_ocr_text: str, binds: dict, player_name: str = "Player", roi=None, boxes=None) -> str:
     txt = raw_ocr_text.strip()
     m_player = re.match(r'^(Player)\s*:\s*(.*)', txt, re.I)
     if m_player:
         p_name = player_name
         msg = m_player.group(2).strip()
         msg_norm = re.sub(r'[^a-zA-Z0-9]', '', msg.lower())
-        if msg_norm in binds:
+        if binds and msg_norm in binds:
             return f"^7{p_name}: {binds[msg_norm]}"
-        for norm_key, raw_bind in binds.items():
-            if norm_key in msg_norm or msg_norm in norm_key:
-                return f"^7{p_name}: {raw_bind}"
-        return f"^7{p_name}: ^7{msg}"
+        if binds:
+            for norm_key, raw_bind in binds.items():
+                if norm_key in msg_norm or msg_norm in norm_key:
+                    return f"^7{p_name}: {raw_bind}"
 
     m_rw = re.search(r'RED\s*TEAM[A-Za-z]?\s+WINS\s+the\s+round!?(.*)', txt, re.I)
     if m_rw:
@@ -852,11 +934,50 @@ def enrich_detected_quake_text(raw_ocr_text: str, binds: dict, player_name: str 
     if re.search(r'round\s+\d+', txt, re.I):
         return f"^3{txt}"
 
-    m_other = re.match(r'^([A-Za-z0-9_]+)\s*:\s*(.*)', txt)
-    if m_other:
-        return f"^7{m_other.group(1)}: ^7{m_other.group(2)}"
+    crop = None
+    if roi is not None and boxes:
+        all_pts = [p for b in boxes for p in b]
+        x_min = max(0, int(min(p[0] for p in all_pts)))
+        x_max = min(roi.shape[1], int(max(p[0] for p in all_pts)))
+        y_min = max(0, int(min(p[1] for p in all_pts)))
+        y_max = min(roi.shape[0], int(max(p[1] for p in all_pts)))
+        crop = roi[y_min:y_max, x_min:x_max]
 
-    return f"^7{txt}"
+    # Team chat: (Player) (Location): Message
+    m_tc = re.match(r'^\(([^)]+)\)\s*\(([^)]+)\)\s*:\s*(.*)', txt)
+    if m_tc:
+        p_name, loc, msg = m_tc.group(1), m_tc.group(2), m_tc.group(3)
+        if crop is not None and crop.shape[1] > 10:
+            w_tot = crop.shape[1]
+            p_end = int(w_tot * (len(p_name) + 2) / len(txt))
+            loc_end = int(w_tot * (len(p_name) + len(loc) + 5) / len(txt))
+            c_p = detect_crop_quake_color(crop[:, :p_end])
+            c_loc = detect_crop_quake_color(crop[:, p_end:loc_end])
+            c_msg = detect_crop_quake_color(crop[:, loc_end:])
+        else:
+            c_p, c_loc, c_msg = "7", "3", "5"
+        c_loc = "3" if c_loc == "7" else c_loc
+        c_msg = "5" if c_msg == "7" else c_msg
+        return f"^{c_p}({p_name}) ^{c_loc}({loc}): ^{c_msg}{msg}"
+
+    # Public say chat: Sender: Message
+    if ":" in txt:
+        colon_idx = txt.find(":")
+        sender = txt[:colon_idx].strip()
+        msg = txt[colon_idx + 1:].strip()
+        if crop is not None and crop.shape[1] > 10:
+            w_tot = crop.shape[1]
+            split_x = int(w_tot * (colon_idx + 1) / len(txt))
+            c_sender = detect_crop_quake_color(crop[:, :split_x])
+            c_msg = detect_crop_quake_color(crop[:, split_x:])
+        else:
+            c_sender, c_msg = "7", "2"
+        if c_msg == "7":
+            c_msg = "2"  # Quake Live default say chat text is green
+        return f"^{c_sender}{sender}: ^{c_msg}{msg}"
+
+    c = detect_crop_quake_color(crop) if crop is not None else "7"
+    return f"^{c}{txt}"
 
 def format_quake_text_to_ass(raw_text: str, max_line_len: int = 36) -> str:
     """
@@ -988,20 +1109,22 @@ def generate_chat_subtitles(video_path: str, max_duration: float = None, player_
                 merged = False
                 for line in lines:
                     if abs(line['y_mid'] - y_mid) < 25:
-                        line['items'].append((x_min, tc))
+                        line['items'].append((x_min, tc, box))
                         merged = True
                         break
                 if not merged:
-                    lines.append({'y_mid': y_mid, 'items': [(x_min, tc)]})
+                    lines.append({'y_mid': y_mid, 'items': [(x_min, tc, box)]})
 
             for line in lines:
-                line_txt = ' '.join(t for _, t in sorted(line['items'], key=lambda x: x[0])).strip()
+                sorted_items = sorted(line['items'], key=lambda x: x[0])
+                line_txt = ' '.join(t for _, t, _ in sorted_items).strip()
                 if len(line_txt) < 3 or line_txt.isdigit() or not re.search(r'[A-Za-z]', line_txt):
                     continue
-                # Skip spectator list and warmup
-                if re.match(r'^(spectators|warmup)\b', line_txt, re.I):
+                # Skip spectator list, warmup, queue status, and chat typing prompt
+                if re.match(r'^(spectators|warmup|\[s\]|queue|say\s*team|say\s*teah|say\b|\[\d+\])\b', line_txt, re.I):
                     continue
-                enriched = enrich_detected_quake_text(line_txt, binds, player_name)
+                boxes = [b for _, _, b in sorted_items]
+                enriched = enrich_detected_quake_text(line_txt, binds, player_name, roi=roi, boxes=boxes)
                 detections.append((t, enriched))
 
         cap.release()
@@ -1009,33 +1132,41 @@ def generate_chat_subtitles(video_path: str, max_duration: float = None, player_
         if not detections:
             return None
 
-        # Group consecutive detections of identical/similar text
-        events = []
-        current_text = None
-        start_t = 0.0
-        last_t = 0.0
+        # Group detections by unique active messages over time
+        active_msgs = {}
+        completed_msgs = []
 
         for t, txt in detections:
             norm_txt = re.sub(r'[^a-zA-Z0-9]', '', txt.lower())
-            if current_text is None:
-                current_text = txt
-                start_t = t
-                last_t = t
-            else:
-                norm_curr = re.sub(r'[^a-zA-Z0-9]', '', current_text.lower())
-                if norm_txt == norm_curr or norm_txt in norm_curr or norm_curr in norm_txt:
-                    last_t = t
-                    if len(txt) > len(current_text):
-                        current_text = txt
+            if not norm_txt:
+                continue
+            matched_key = None
+            for k in active_msgs:
+                if norm_txt == k or (len(norm_txt) >= 6 and norm_txt in k) or (len(k) >= 6 and k in norm_txt):
+                    matched_key = k
+                    break
+            if matched_key:
+                if t - active_msgs[matched_key]["last"] <= 2.0:
+                    active_msgs[matched_key]["last"] = t
+                    active_msgs[matched_key]["variants"][txt] += 1
+                    continue
                 else:
-                    if last_t - start_t >= 0.2:
-                        events.append((start_t, min(limit_time, max(start_t + 4.5, last_t + 2.5)), current_text))
-                    current_text = txt
-                    start_t = t
-                    last_t = t
+                    completed_msgs.append(active_msgs.pop(matched_key))
 
-        if current_text and (last_t - start_t >= 0.2):
-            events.append((start_t, min(limit_time, max(start_t + 4.5, last_t + 2.5)), current_text))
+            active_msgs[norm_txt] = {"start": t, "last": t, "variants": Counter([txt])}
+
+        for item in active_msgs.values():
+            completed_msgs.append(item)
+
+        events = []
+        for c in completed_msgs:
+            if c["last"] - c["start"] >= 0.2:
+                best_txt = c["variants"].most_common(1)[0][0]
+                if re.search(r'mapmanager|history\s*\(', best_txt, re.I):
+                    continue
+                events.append((c["start"], min(limit_time, max(c["start"] + 3.0, c["last"] + 1.5)), best_txt))
+
+        events.sort(key=lambda x: x[0])
 
         if not events:
             return None
@@ -1075,11 +1206,517 @@ def generate_chat_subtitles(video_path: str, max_duration: float = None, player_
         print(f"Chat subtitle extraction error on {video_path}: {e}")
         return None
 
-def convert_to_shorts_format(video_path: str, output_path: str = None, style: str = "crop", max_duration: float = None, subtitles_ass_path: str = None, include_hud: bool = True, target_lufs: float = -15.0, true_peak: float = -1.5) -> str:
+QUAKE_PK3_PATH = Path.home() / ".local/share/Steam/steamapps/common/Quake Live/baseq3/pak00.pk3"
+
+def extract_quake_sound_to_temp(rel_path: str, out_name: str = None) -> str:
+    """Extracts an audio file directly from Quake Live pak00.pk3 to /tmp."""
+    if not QUAKE_PK3_PATH.exists():
+        return None
+    try:
+        import zipfile
+        out_file = Path(f"/tmp/{out_name or Path(rel_path).name}")
+        if out_file.exists() and out_file.stat().st_size > 100:
+            return str(out_file)
+        with zipfile.ZipFile(QUAKE_PK3_PATH, "r") as zf:
+            if rel_path in zf.namelist():
+                out_file.write_bytes(zf.read(rel_path))
+                return str(out_file)
+    except Exception as e:
+        print(f"Quake PK3 sound extraction notice ({rel_path}): {e}")
+    return None
+
+def get_action_excitement_metadata(weapon: str = "", feat: str = "", title: str = "") -> dict:
+    w = (weapon or "").lower()
+    f = (feat or "").lower()
+    t = (title or "").lower()
+
+    vo = "sound/vo/holy_shit.ogg"
+    emojis = ["😱", "🤯", "💥"]
+    banner_main = "INSANE COMBAT PLAY!"
+    banner_sub = "QUAKE LIVE HIGHLIGHT"
+
+    if "400" in t or "400" in f or "quad" in t or "quad" in f:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["😱", "🤯", "💥"]
+        banner_main = "400 DAMAGE! (100 x 4)"
+        banner_sub = "QUAD-HIT GRENADE"
+    elif "midair" in f or "midair" in t or "air rocket" in f or "air rocket" in t:
+        vo = "sound/vo/midair1.ogg"
+        emojis = ["🚀", "🎯", "💥"]
+        banner_main = "MIDAIR PREDICTION!"
+        banner_sub = "AIR DIRECT HIT"
+    elif "impressive" in f or "impressive" in t or "3 rails" in t or "consecutive rails" in f:
+        vo = "sound/vo/impressive1.ogg"
+        emojis = ["⚡", "🎯", "💀"]
+        banner_main = "IMPRESSIVE ACCURACY!"
+        banner_sub = "PINPOINT RAILGUN HIT"
+    elif "telefrag" in f or "telefrag" in t or "telefrag" in w:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["🌀", "💀", "🤯"]
+        banner_main = "DISGUSTING TELEFRAG!"
+        banner_sub = "WRONG PLACE, WRONG TIME"
+    elif "gauntlet" in w or "humiliation" in f or "humiliation" in t:
+        vo = "sound/vo/humiliation1.ogg"
+        emojis = ["🥊", "💀", "🤣"]
+        banner_main = "HUMILIATION!"
+        banner_sub = "GAUNTLET MELEE FINISH"
+    elif "two frags" in f or "excellent" in f or "excellent" in t:
+        vo = "sound/vo/excellent1.ogg"
+        emojis = ["💀", "⚡", "🔥"]
+        banner_main = "EXCELLENT MEDAL!"
+        banner_sub = "TWO FAST FRAGS"
+    elif "rocket" in w or "rocket" in t:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["🚀", "💥", "🎯"]
+        banner_main = "DIRECT ROCKET HIT!"
+        banner_sub = "ROCKET LAUNCHER"
+    elif "lava" in t or "lava" in f:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["🌋", "⚡", "💀"]
+        banner_main = "KNOCKED INTO LAVA!"
+        banner_sub = "ENVIRONMENTAL ELIMINATION"
+    elif "clutch" in t or "clutch" in f or "game-ending" in t or "game-ending" in f:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["🔥", "🏆", "💀"]
+        banner_main = "CLUTCH ROUND WIN!"
+        banner_sub = "ARENA DUEL VICTORY"
+    elif "railgun" in w:
+        vo = "sound/vo/impressive1.ogg"
+        emojis = ["⚡", "🎯", "💀"]
+        banner_main = "CLEAN RAILGUN HIT!"
+        banner_sub = "RAILGUN"
+
+    return {
+        "vo_path": vo,
+        "emojis": emojis,
+        "banner_main": banner_main,
+        "banner_sub": banner_sub
+    }
+
+def render_emoji_image(char: str, size: int = 220) -> Image.Image:
+    font_path = "/usr/share/fonts/noto/NotoColorEmoji.ttf"
+    if not os.path.exists(font_path):
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.new("RGBA", (140, 140), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.truetype(font_path, 109)
+        draw.text((10, 10), char, font=font, embedded_color=True)
+        bbox = img.getbbox()
+        if bbox:
+            cropped = img.crop(bbox)
+            return cropped.resize((size, size), Image.Resampling.LANCZOS)
+        return img.resize((size, size))
+    except Exception as e:
+        print(f"Emoji render error ({char}): {e}")
+        return None
+
+def detect_action_climax_window(video_path: str, max_duration: float = None) -> tuple:
+    try:
+        import cv2
+        from rapidocr_onnxruntime import RapidOCR
+        engine = RapidOCR()
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return None
+        dur = total_frames / fps
+        limit_time = min(dur, max_duration) if max_duration else dur
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        scan_start = max(1.0, min(3.0, limit_time * 0.25))
+        scan_end = max(scan_start + 0.5, limit_time - 0.2)
+        step = max(1, int(fps * 0.15))
+
+        best_score = 0
+        best_t = scan_start + (scan_end - scan_start) * 0.5
+        best_cx, best_cy = w // 2, int(h * 0.48)
+
+        for fno in range(int(fps * scan_start), int(fps * scan_end), step):
+            t = fno / fps
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            roi = frame[int(h*0.20):int(h*0.80), int(w*0.25):int(w*0.80)]
+            res, _ = engine(roi)
+            score = 0
+            boxes = []
+            for box, txt, _ in (res or []):
+                tc = txt.strip()
+                if "100" in tc:
+                    score += 50
+                    boxes.append(box)
+                elif tc.isdigit() and int(tc) in range(15, 120):
+                    score += 20
+                    boxes.append(box)
+                elif re.search(r"fragged\b", tc, re.I):
+                    score += 60
+                    boxes.append(box)
+            if score > best_score:
+                best_score = score
+                best_t = t
+                if boxes:
+                    all_pts = [p for b in boxes for p in b]
+                    best_cx = int(min(p[0] for p in all_pts) + max(p[0] for p in all_pts)) // 2 + int(w * 0.25)
+                    best_cy = int(min(p[1] for p in all_pts) + max(p[1] for p in all_pts)) // 2 + int(h * 0.20)
+
+        cap.release()
+        t_start = max(0.5, best_t - 0.25)
+        t_end = min(limit_time - 0.1, best_t + 0.75)
+        return t_start, t_end, best_cx, best_cy, best_score
+    except Exception as e:
+        print(f"Action climax detection notice: {e}")
+        return None
+
+def adjust_ass_for_slowmo(ass_path: str, t_start: float, t_end: float, repeat_factor: int) -> str:
+    """
+    Linearly scales ASS subtitle event timestamps to match slow-motion video expansion.
+    """
+    if not ass_path or not os.path.exists(ass_path):
+        return ass_path
+    def time_to_sec(ts):
+        parts = ts.strip().split(":")
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    def sec_to_time(s):
+        s = max(0.0, s)
+        h = int(s // 3600)
+        m = int((s % 3600) // 60)
+        sec = s % 60
+        return f"{h}:{m:02d}:{sec:05.2f}"
+
+    def remap_t(t):
+        if t <= t_start:
+            return t
+        elif t <= t_end:
+            return t_start + (t - t_start) * repeat_factor
+        else:
+            return t + (repeat_factor - 1) * (t_end - t_start)
+
+    out_lines = []
+    try:
+        with open(ass_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Dialogue:"):
+                    parts = line.split(",", 9)
+                    if len(parts) >= 10:
+                        st = time_to_sec(parts[1])
+                        et = time_to_sec(parts[2])
+                        parts[1] = sec_to_time(remap_t(st))
+                        parts[2] = sec_to_time(remap_t(et))
+                        line = ",".join(parts)
+                out_lines.append(line)
+
+        adj_path = f"/tmp/adj_{int(time.time()*1000)}_{Path(ass_path).name}"
+        with open(adj_path, "w", encoding="utf-8") as f:
+            f.writelines(out_lines)
+        return adj_path
+    except Exception as e:
+        print("Subtitle slowmo adjust notice:", e)
+        return ass_path
+
+def render_action_slowmo_short(
+    video_path: str,
+    output_path: str,
+    max_duration: float = None,
+    subtitles_ass_path: str = None,
+    include_hud: bool = True,
+    target_lufs: float = -15.0,
+    true_peak: float = -1.5,
+    weapon: str = "",
+    feat: str = "",
+    title: str = "",
+    slowmo_speed: float = 0.25,
+    enable_zoom: bool = True,
+    enable_emojis: bool = True,
+    enable_audio_sfx: bool = True
+) -> bool:
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return False
+
+        dur = total_frames / fps
+        limit_time = min(dur, max_duration) if max_duration else dur
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        climax_data = detect_action_climax_window(video_path, max_duration=limit_time)
+        if not climax_data:
+            cap.release()
+            return False
+
+        t_start, t_end, cx, cy, score = climax_data
+        if t_start >= limit_time - 0.4:
+            cap.release()
+            return False
+
+        f_start = int(fps * t_start)
+        f_end = int(fps * t_end)
+        if f_end <= f_start:
+            cap.release()
+            return False
+
+        repeat_factor = max(2, int(round(1.0 / max(0.1, slowmo_speed))))
+
+        # Crop parameters
+        std_w = int(h / 2) # 720
+        std_h = int(h * 8 / 9) # 1280
+        std_x = (w - std_w) // 2
+        std_y = 0
+
+        if enable_zoom:
+            zoom_w = int(std_w * 0.75) # 540
+            zoom_h = int(zoom_w * 16 / 9) # 960
+            zoom_x = max(0, min(w - zoom_w, cx - zoom_w // 2))
+            zoom_y = max(0, min(h - zoom_h, cy - zoom_h // 2))
+        else:
+            zoom_w, zoom_h, zoom_x, zoom_y = std_w, std_h, std_x, std_y
+
+        zoom_cx = zoom_x + zoom_w // 2
+        zoom_cy = zoom_y + zoom_h // 2
+
+        out_w, out_h = 1440, 2560
+        temp_raw_video = f"/tmp/slowmo_raw_{int(time.time()*1000)}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(temp_raw_video, fourcc, fps, (out_w, out_h))
+
+        meta = get_action_excitement_metadata(weapon, feat, title)
+        banner_img = None
+        emoji_imgs = []
+        if enable_emojis:
+            try:
+                banner_img = Image.new("RGBA", (1200, 220), (0, 0, 0, 0))
+                bdraw = ImageDraw.Draw(banner_img)
+                bdraw.rounded_rectangle([(10, 10), (1190, 210)], radius=30, fill=(0, 0, 0, 190), outline=(255, 50, 50, 240), width=6)
+                tfont = ImageFont.truetype("/usr/share/fonts/noto/NotoSans-Bold.ttf", 68)
+                bdraw.text((600, 75), meta["banner_main"], font=tfont, fill=(255, 230, 40), anchor="mm")
+                sfont = ImageFont.truetype("/usr/share/fonts/noto/NotoSans-Bold.ttf", 46)
+                bdraw.text((600, 150), meta["banner_sub"], font=sfont, fill=(255, 80, 80), anchor="mm")
+
+                for em in meta["emojis"][:3]:
+                    em_img = render_emoji_image(em, size=220)
+                    if em_img:
+                        emoji_imgs.append(em_img)
+            except Exception as e:
+                print(f"Banner/emoji render notice: {e}")
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame_idx = 0
+        last_action_frame = None
+        f_limit = int(fps * limit_time)
+        has_aftermath = (f_end < f_limit - int(fps * 0.3))
+
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame_idx >= f_limit:
+                break
+
+            if frame_idx < f_start:
+                # 1. Buildup at normal 1.0x speed with HUD
+                cropped = frame[std_y:std_y + std_h, std_x:std_x + std_w]
+                scaled = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+
+                if include_hud:
+                    top_crop = frame[int(10*h/1440):int(140*h/1440), 0:int(1000*w/2560)]
+                    top_scaled = cv2.resize(top_crop, (1200, int(130 * 1200 / 1000)))
+                    th, tw, _ = top_scaled.shape
+                    scaled[60:60+th, (out_w-tw)//2:(out_w-tw)//2+tw] = top_scaled
+
+                    bot_crop = frame[int(1290*h/1440):int(1435*h/1440), int(700*w/2560):int(1860*w/2560)]
+                    bot_scaled = cv2.resize(bot_crop, (1400, int(145 * 1400 / 1160)))
+                    bh, bw, _ = bot_scaled.shape
+                    scaled[out_h-bh-30:out_h-30, (out_w-bw)//2:(out_w-bw)//2+bw] = bot_scaled
+
+                writer.write(scaled)
+
+            elif frame_idx <= f_end:
+                # 2. Action climax slow-mo zoom with emojis & highlight banner
+                progress = (frame_idx - f_start) / float(max(1, f_end - f_start))
+                cur_w = int(std_w + (zoom_w - std_w) * min(1.0, progress * 3.5))
+                cur_h = int(cur_w * 16 / 9)
+                cur_cx = int(std_x + std_w//2 + (zoom_cx - (std_x + std_w//2)) * min(1.0, progress * 3.5))
+                cur_cy = int(std_y + std_h//2 + (zoom_cy - (std_y + std_h//2)) * min(1.0, progress * 3.5))
+
+                x1 = max(0, min(w - cur_w, cur_cx - cur_w // 2))
+                y1 = max(0, min(h - cur_h, cur_cy - cur_h // 2))
+                cropped = frame[y1:y1 + cur_h, x1:x1 + cur_w]
+                scaled = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+
+                if enable_emojis and banner_img:
+                    pil_frame = Image.fromarray(cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB))
+                    pil_frame.paste(banner_img, ((out_w - 1200) // 2, 200), banner_img)
+                    offset_y = int(np.sin(progress * np.pi * 3) * 25)
+                    if len(emoji_imgs) >= 1:
+                        pil_frame.paste(emoji_imgs[0], (80, 1100 + offset_y), emoji_imgs[0])
+                    if len(emoji_imgs) >= 2:
+                        pil_frame.paste(emoji_imgs[1], (out_w - 80 - 220, 1100 - offset_y), emoji_imgs[1])
+                    if len(emoji_imgs) >= 3:
+                        pil_frame.paste(emoji_imgs[2], ((out_w - 220) // 2, 1920), emoji_imgs[2])
+                    scaled = cv2.cvtColor(np.array(pil_frame), cv2.COLOR_RGB2BGR)
+
+                last_action_frame = scaled
+                for _ in range(repeat_factor):
+                    writer.write(scaled)
+
+            else:
+                # 3. Aftermath at 1.0x normal speed showing round conclusion & chat reactions
+                cropped = frame[std_y:std_y + std_h, std_x:std_x + std_w]
+                scaled = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+
+                if include_hud:
+                    top_crop = frame[int(10*h/1440):int(140*h/1440), 0:int(1000*w/2560)]
+                    top_scaled = cv2.resize(top_crop, (1200, int(130 * 1200 / 1000)))
+                    th, tw, _ = top_scaled.shape
+                    scaled[60:60+th, (out_w-tw)//2:(out_w-tw)//2+tw] = top_scaled
+
+                    bot_crop = frame[int(1290*h/1440):int(1435*h/1440), int(700*w/2560):int(1860*w/2560)]
+                    bot_scaled = cv2.resize(bot_crop, (1400, int(145 * 1400 / 1160)))
+                    bh, bw, _ = bot_scaled.shape
+                    scaled[out_h-bh-30:out_h-30, (out_w-bw)//2:(out_w-bw)//2+bw] = bot_scaled
+
+                writer.write(scaled)
+
+            frame_idx += 1
+
+        if not has_aftermath and last_action_frame is not None:
+            for i in range(36):
+                fade = 1.0 - (i / 36.0) * 0.35
+                writer.write((last_action_frame * fade).astype(np.uint8))
+
+        cap.release()
+        writer.release()
+
+        temp_normal_a = f"/tmp/slowmo_norm_a_{int(time.time()*1000)}.wav"
+        temp_slow_a = f"/tmp/slowmo_slow_a_{int(time.time()*1000)}.wav"
+        temp_after_a = f"/tmp/slowmo_after_a_{int(time.time()*1000)}.wav"
+        temp_mixed_a = f"/tmp/slowmo_mixed_a_{int(time.time()*1000)}.wav"
+
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", "0.0", "-to", str(t_start),
+            "-i", video_path, "-vn", "-c:a", "pcm_s16le", temp_normal_a
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", str(t_start), "-to", str(t_end),
+            "-i", video_path, "-vn",
+            "-af", "atempo=0.5,atempo=0.5,lowpass=f=3500",
+            "-c:a", "pcm_s16le", temp_slow_a
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        inputs = ["-i", temp_normal_a, "-i", temp_slow_a]
+        n_concat = 2
+
+        if has_aftermath:
+            subprocess.run([
+                "ffmpeg", "-y", "-ss", str(t_end), "-to", str(limit_time),
+                "-i", video_path, "-vn", "-c:a", "pcm_s16le", temp_after_a
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            inputs.extend(["-i", temp_after_a])
+            n_concat = 3
+
+        concat_inputs_str = "".join([f"[{i}:a]" for i in range(n_concat)])
+        filter_parts = [f"{concat_inputs_str}concat=n={n_concat}:v=0:a=1[game_full]"]
+        in_count = n_concat
+
+        impact_sfx = extract_quake_sound_to_temp("sound/feedback/impact6.ogg", "quake_impact6.ogg")
+        announcer_vo = extract_quake_sound_to_temp(meta["vo_path"], f"quake_vo_{Path(meta['vo_path']).name}")
+
+        s_ms = int(t_start * 1000)
+        vo_ms = s_ms + 180
+
+        if enable_audio_sfx and impact_sfx and os.path.exists(impact_sfx):
+            inputs.extend(["-i", impact_sfx])
+            filter_parts.append(f"[{in_count}:a]adelay={s_ms}|{s_ms},volume=1.5[sfx_impact]")
+            in_count += 1
+
+        if enable_audio_sfx and announcer_vo and os.path.exists(announcer_vo):
+            inputs.extend(["-i", announcer_vo])
+            filter_parts.append(f"[{in_count}:a]adelay={vo_ms}|{vo_ms},volume=2.2[sfx_vo]")
+            in_count += 1
+
+        mix_inputs = "[game_full]"
+        if in_count == n_concat + 1:
+            mix_inputs += "[sfx_impact]"
+        elif in_count == n_concat + 2:
+            mix_inputs += "[sfx_impact][sfx_vo]"
+        num_mix = 1 + (1 if (enable_audio_sfx and impact_sfx and os.path.exists(impact_sfx)) else 0) + (1 if (enable_audio_sfx and announcer_vo and os.path.exists(announcer_vo)) else 0)
+        filter_parts.append(f"{mix_inputs}amix=inputs={num_mix}:duration=first:dropout_transition=2[mixed]")
+
+        aftermath_dur = (limit_time - t_end) if has_aftermath else (36.0 / fps)
+        total_rendered_dur = t_start + (t_end - t_start) * repeat_factor + aftermath_dur
+        fade_start = max(1.0, total_rendered_dur - 0.4)
+        filter_parts.append(f"[mixed]afade=t=out:st={fade_start:.2f}:d=0.4,loudnorm=I={target_lufs}:LRA=7:TP={true_peak}[outa]")
+
+        cmd_mix = ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[outa]",
+            "-c:a", "pcm_s16le", temp_mixed_a
+        ]
+        subprocess.run(cmd_mix, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        adjusted_ass = None
+        if subtitles_ass_path and os.path.exists(subtitles_ass_path):
+            adjusted_ass = adjust_ass_for_slowmo(subtitles_ass_path, t_start, t_end, repeat_factor)
+
+        vf_args = []
+        if adjusted_ass and os.path.exists(adjusted_ass):
+            vf_args = ["-vf", f"ass='{adjusted_ass}'"]
+
+        cmd_nvenc = [
+            "ffmpeg", "-y",
+            "-i", temp_raw_video,
+            "-i", temp_mixed_a,
+        ] + vf_args + [
+            "-c:v", "h264_nvenc",
+            "-preset", "p5",
+            "-tune", "hq",
+            "-cq", "12",
+            "-b:v", "45M",
+            "-maxrate", "60M",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "256k",
+            "-shortest",
+            output_path
+        ]
+        res = subprocess.run(cmd_nvenc, capture_output=True, text=True)
+
+        for tmp_f in [temp_raw_video, temp_normal_a, temp_slow_a, temp_after_a, temp_mixed_a, adjusted_ass]:
+            if tmp_f and os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
+
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            print(f"[Action Slow-Mo] Rendered enhanced short ({t_start:.2f}s -> {t_end:.2f}s zoomed {repeat_factor}x slow-mo with Quake VO: {Path(meta['vo_path']).stem}).")
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"Action slow-mo render notice on {video_path}: {e}")
+        return False
+
+def convert_to_shorts_format(video_path: str, output_path: str = None, style: str = "crop", max_duration: float = None, subtitles_ass_path: str = None, include_hud: bool = True, target_lufs: float = -15.0, true_peak: float = -1.5, weapon: str = "", feat: str = "", custom_title: str = "", enable_action_slowmo: bool = True, slowmo_speed: float = 0.25, enable_zoom: bool = True, enable_emojis: bool = True, enable_audio_sfx: bool = True) -> str:
     """
     Converts 16:9 gameplay footage into 9:16 vertical YouTube Shorts format.
     Style B ('crop'):
       - 1440x2560 (2K Vertical @ 60FPS) master encode.
+      - Automatically detects action climax, adds dynamic zoom, deep slow-motion,
+        fitting surprise/weapon emojis, and iconic Quake announcer excitement audio.
       - Lanczos upscaling with unsharp-mask edge sharpening.
       - Encoded via NVENC Preset P7 High Quality at 45-60 Mbps.
       - Overlays full Health/Armor HUD at bottom & live Red/Blue scores up top (when include_hud=True).
@@ -1090,6 +1727,27 @@ def convert_to_shorts_format(video_path: str, output_path: str = None, style: st
     if not output_path:
         p = Path(video_path)
         output_path = f"/tmp/{p.stem}_shorts_{int(time.time())}.mp4"
+
+    # Action slow-mo & excitement processing
+    if style == "crop" and enable_action_slowmo:
+        success = render_action_slowmo_short(
+            video_path=video_path,
+            output_path=output_path,
+            max_duration=max_duration,
+            subtitles_ass_path=subtitles_ass_path,
+            include_hud=include_hud,
+            target_lufs=target_lufs,
+            true_peak=true_peak,
+            weapon=weapon,
+            feat=feat,
+            title=custom_title,
+            slowmo_speed=slowmo_speed,
+            enable_zoom=enable_zoom,
+            enable_emojis=enable_emojis,
+            enable_audio_sfx=enable_audio_sfx
+        )
+        if success and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            return output_path
 
     trim_args = ["-t", f"{max_duration:.3f}"] if (max_duration is not None and max_duration > 0) else []
     # EBU R128 loudness normalization targeting -15 LUFS (comfortable, non-fatiguing volume)
@@ -1606,7 +2264,7 @@ def _execute_video_upload(youtube, file_path: str, title: str, description: str,
 
     return video_id, video_url
 
-def upload_video(video_path: str, enemy: str = None, weapon: str = None, special_play: str = None, custom_title: str = None, prompt: bool = False, shorts: bool = None, shorts_style: str = None, dual_upload: bool = None, cut_on_death: bool = None, include_hud: bool = None, player: str = None, custom_desc: str = None):
+def upload_video(video_path: str, enemy: str = None, weapon: str = None, special_play: str = None, custom_title: str = None, prompt: bool = False, shorts: bool = None, shorts_style: str = None, dual_upload: bool = None, cut_on_death: bool = None, include_hud: bool = None, player: str = None, custom_desc: str = None, action_slowmo: bool = None, slowmo_speed: float = None, action_zoom: bool = None, action_emojis: bool = None, action_audio: bool = None, start_time: float = None):
     if not os.path.exists(video_path):
         notify("Upload Failed", f"File not found: {video_path}", icon="dialog-error")
         return
@@ -1622,6 +2280,23 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
                 overrides = all_overrides.get(stem, {})
         except Exception as e:
             print("Error loading clip overrides:", e)
+
+    start_time = start_time if start_time is not None else float(overrides.get("start_time", 0.0))
+    temp_trimmed_source = None
+    original_video_to_move = video_path
+    if start_time > 0.05:
+        temp_trimmed_source = f"/tmp/{stem}_start_{start_time:.2f}_{int(time.time())}.mp4"
+        cmd_trim = [
+            "ffmpeg", "-y", "-ss", str(start_time),
+            "-i", video_path,
+            "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "14",
+            "-c:a", "aac", "-b:a", "320k",
+            temp_trimmed_source
+        ]
+        res_trim = subprocess.run(cmd_trim, capture_output=True, text=True)
+        if res_trim.returncode == 0 and os.path.exists(temp_trimmed_source) and os.path.getsize(temp_trimmed_source) > 1000:
+            print(f"[Clip Trim] Cut beginning from 0.0s to {start_time:.2f}s as requested.")
+            video_path = temp_trimmed_source
 
     player_name = player or overrides.get("player") or config.get("player_name", "Player")
     enemy = enemy or overrides.get("enemy")
@@ -1684,6 +2359,12 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
     should_dual = dual_upload if dual_upload is not None else config.get("dual_upload", True)
     should_include_hud = include_hud if include_hud is not None else config.get("include_hud_overlays", True)
 
+    enable_action_slowmo = action_slowmo if action_slowmo is not None else config.get("action_slowmo", True)
+    speed_action_slowmo = slowmo_speed if slowmo_speed is not None else float(config.get("action_slowmo_speed", 0.25))
+    enable_zoom = action_zoom if action_zoom is not None else config.get("action_zoom", True)
+    enable_emojis = action_emojis if action_emojis is not None else config.get("action_emojis", True)
+    enable_audio_sfx = action_audio if action_audio is not None else config.get("action_excitement_audio", True)
+
     # Left-side chat & announcements subtitle overlay
     subtitles_ass = None
     if is_shorts and config.get("display_left_chat", True):
@@ -1711,7 +2392,8 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         cut_notice = f"\nStopping at {cut_duration:.1f}s (cut before respawn)" if cut_duration else ""
         chat_notice = "\nChat text displayed at bottom" if subtitles_ass else ""
         hud_notice = "\nHUD (Scores & Health/Armor) included" if should_include_hud else ""
-        notify("📱 Creating YouTube Short (9:16)...", f"{Path(video_path).name}{cut_notice}{chat_notice}{hud_notice}\nFormatting {style_desc} with NVENC...", icon="video-x-generic", expire_ms=3500)
+        slowmo_notice = f"\nAction Climax Slow-Mo ({speed_action_slowmo}x) & SFX" if (shorts_style == "crop" and enable_action_slowmo) else ""
+        notify("📱 Creating YouTube Short (9:16)...", f"{Path(video_path).name}{cut_notice}{chat_notice}{hud_notice}{slowmo_notice}\nFormatting {style_desc} with NVENC...", icon="video-x-generic", expire_ms=3500)
         
         shorts_target = None
         target_lufs = float(config.get("audio_loudness_i", -15.0))
@@ -1724,7 +2406,15 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
                 subtitles_ass_path=subtitles_ass,
                 include_hud=should_include_hud,
                 target_lufs=target_lufs,
-                true_peak=target_tp
+                true_peak=target_tp,
+                weapon=weapon or "",
+                feat=special_play or "",
+                custom_title=custom_title or "",
+                enable_action_slowmo=enable_action_slowmo,
+                slowmo_speed=speed_action_slowmo,
+                enable_zoom=enable_zoom,
+                enable_emojis=enable_emojis,
+                enable_audio_sfx=enable_audio_sfx
             )
         except Exception as e:
             print("Shorts conversion failed:", e)
@@ -1799,7 +2489,7 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         # Move uploaded video to 'uploaded' subfolder
         dest_moved_path = None
         try:
-            v_orig = Path(video_path).resolve()
+            v_orig = Path(original_video_to_move).resolve()
             if v_orig.is_file() and v_orig.parent.name != "uploaded":
                 dest_dir = v_orig.parent / "uploaded"
                 dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1816,6 +2506,12 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
             notify("✅ Dual YouTube Upload Complete! (PUBLIC)", f"📱 Short: {uploaded_links[0]}\n🖥️ 1440p: {uploaded_links[1]}{subfolder_note}", icon="dialog-ok", expire_ms=8000)
         else:
             notify("✅ YouTube Upload Complete! (PUBLIC)", f"Link copied: {primary_link}{subfolder_note}", icon="dialog-ok", expire_ms=7000)
+
+    if temp_trimmed_source and os.path.exists(temp_trimmed_source):
+        try:
+            os.remove(temp_trimmed_source)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     import argparse
@@ -1837,6 +2533,16 @@ if __name__ == "__main__":
     parser.add_argument("--no-cut-on-death", "--no-cut-respawn", dest="cut_on_death", action="store_false", help="Do not cut video before respawn")
     parser.add_argument("--include-hud", dest="include_hud", action="store_true", default=None, help="Include top scores and full bottom Health/Armor HUD overlay")
     parser.add_argument("--no-include-hud", dest="include_hud", action="store_false", help="Do not overlay HUD elements")
+    parser.add_argument("--slowmo", dest="action_slowmo", action="store_true", default=None, help="Enable action climax slow-motion zoom & highlights")
+    parser.add_argument("--no-slowmo", dest="action_slowmo", action="store_false", help="Disable action climax slow-motion")
+    parser.add_argument("--slowmo-speed", type=float, default=None, help="Action slow-motion playback speed (default: 0.25)")
+    parser.add_argument("--zoom", dest="action_zoom", action="store_true", default=None, help="Enable dynamic action zoom on climax/frags")
+    parser.add_argument("--no-zoom", dest="action_zoom", action="store_false", help="Disable dynamic action zoom")
+    parser.add_argument("--emojis", dest="action_emojis", action="store_true", default=None, help="Enable excitement/weapon emoji overlays")
+    parser.add_argument("--no-emojis", dest="action_emojis", action="store_false", help="Disable emoji overlays")
+    parser.add_argument("--excitement-audio", dest="action_audio", action="store_true", default=None, help="Enable iconic Quake announcer & excitement audio")
+    parser.add_argument("--no-excitement-audio", dest="action_audio", action="store_false", help="Disable excitement audio")
+    parser.add_argument("--start-time", "--ss", type=float, default=None, help="Start time in seconds to cut off beginning of video")
     args = parser.parse_args()
 
     upload_video(
@@ -1852,5 +2558,11 @@ if __name__ == "__main__":
         cut_on_death=args.cut_on_death,
         include_hud=args.include_hud,
         player=args.player,
-        custom_desc=args.desc
+        custom_desc=args.desc,
+        action_slowmo=args.action_slowmo,
+        slowmo_speed=args.slowmo_speed,
+        action_zoom=args.action_zoom,
+        action_emojis=args.action_emojis,
+        action_audio=args.action_audio,
+        start_time=args.start_time
     )
