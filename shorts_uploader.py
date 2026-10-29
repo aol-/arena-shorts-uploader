@@ -189,7 +189,8 @@ IGNORE_WORDS = {
     'player stats', 'player', 'player (6/6)', 'dmg weap', 'item to use', 'no item to use', 'item to u',
     'dead and gone', 'dead and', 'community server - dead and gone', 'community server - aerowalk',
     'aerowalk', 'verticalvengeance', 'overkill', '12players', 'veap', 'the last s', 'last s',
-    'grinder', 'beams', 'blood run', 'the last standing'
+    'grinder', 'beams', 'blood run', 'the last standing', 'live', 'quake live', 'quake', 'quakelive',
+    'dead', 'noitem', 'noitemtouse', 'no item to use', 'team'
 }
 
 def clean_player_name(raw: str, server_players: list = None) -> str:
@@ -212,6 +213,8 @@ def clean_player_name(raw: str, server_players: list = None) -> str:
     if s == '^':
         return '^'
     if not s or s.lower() in IGNORE_WORDS or s.isdigit():
+        return ''
+    if s.lower() in ['live', 'quake', 'quakelive', 'dead', 'loe', 'oe', 'item', 'team']:
         return ''
     if re.search(r'\b(score\s+k/?d|k/?d|dmg\s+weap|player\s*\(\d+/\d+\))\b', s, re.I):
         return ''
@@ -260,6 +263,7 @@ def analyze_video_gameplay(video_path: str) -> dict:
         percentages = [0.35, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
         frag_victims = Counter()
+        roster_victims = Counter()
         killfeed_victims = Counter()
         combat_names = Counter()
         frag_weapons = Counter()
@@ -290,26 +294,40 @@ def analyze_video_gameplay(video_path: str) -> dict:
                 continue
             h, w, _ = frame.shape
 
-            # Weapon check from bottom-center active weapon icon
-            bc = frame[int(h * 0.90):int(h * 0.99), int(w * 0.42):int(w * 0.50)]
+            # Weapon check from bottom-center active weapon icon (to the left of ammo counter)
+            # Scoped to icon area: h: 0.86..0.98, w: 0.43..0.49
+            bc = frame[int(h * 0.86):int(h * 0.98), int(w * 0.43):int(w * 0.49)]
             hsv = cv2.cvtColor(bc, cv2.COLOR_BGR2HSV)
+            mask_purple = cv2.inRange(hsv, (120, 60, 60), (165, 255, 255))
             mask_green = cv2.inRange(hsv, (35, 100, 100), (85, 255, 255))
-            mask_red1 = cv2.inRange(hsv, (0, 120, 120), (10, 255, 255))
-            mask_orange = cv2.inRange(hsv, (11, 140, 140), (25, 255, 255))
-            mask_yellow = cv2.inRange(hsv, (26, 120, 120), (34, 255, 255))
-            mask_cyan = cv2.inRange(hsv, (85, 120, 120), (105, 255, 255))
+            mask_red = cv2.bitwise_or(
+                cv2.inRange(hsv, (0, 120, 120), (10, 255, 255)),
+                cv2.inRange(hsv, (170, 120, 120), (180, 255, 255))
+            )
+            mask_orange = cv2.inRange(hsv, (11, 140, 140), (22, 255, 255))
+            mask_yellow = cv2.inRange(hsv, (23, 100, 100), (35, 255, 255))
+            mask_cyan = cv2.inRange(hsv, (85, 100, 100), (105, 255, 255))
+
+            c_purple = cv2.countNonZero(mask_purple)
+            c_green = cv2.countNonZero(mask_green)
+            c_red = cv2.countNonZero(mask_red)
+            c_yellow = cv2.countNonZero(mask_yellow)
+            c_orange = cv2.countNonZero(mask_orange)
+            c_cyan = cv2.countNonZero(mask_cyan)
 
             current_wep = None
-            if cv2.countNonZero(mask_green) > 30:
+            if c_purple > 200 and c_purple > c_red:
+                current_wep = "Plasma Gun"
+            elif c_green > 200 and c_green > c_red:
                 current_wep = "Railgun"
-            elif cv2.countNonZero(mask_orange) > 30:
-                current_wep = "Shotgun"
-            elif cv2.countNonZero(mask_red1) > 30:
-                current_wep = "Rocket Launcher"
-            elif cv2.countNonZero(mask_yellow) > 30:
+            elif c_yellow > 200 and c_yellow > c_red:
                 current_wep = "Lightning Gun"
-            elif cv2.countNonZero(mask_cyan) > 30 and has_humiliation:
+            elif c_cyan > 200 and has_humiliation:
                 current_wep = "Gauntlet"
+            elif c_orange > 200 and c_orange > c_red:
+                current_wep = "Shotgun"
+            elif c_red > 200:
+                current_wep = "Rocket Launcher"
 
             # 1. Authoritative Frag Announcement ('You fragged <Player>.') in center-upper screen
             frag_roi = frame[int(h * 0.12):int(h * 0.35), int(w * 0.20):int(w * 0.80)]
@@ -323,38 +341,45 @@ def analyze_video_gameplay(video_path: str) -> dict:
                     has_excellent_medal = True
                 if re.search(r'match\s*summary', t, re.I) or re.search(r'roundlimit', t, re.I) or re.search(r'wins\s+by\s+a\s+score', t, re.I) or re.search(r'wins\s+the\s+round', t, re.I):
                     is_game_ending = True
-                m = re.search(r'(?:you\s*)?fragged\s+([A-Za-z0-9_\u4e00-\u9fff™\.\-\^]+)', t, re.I)
+                m = re.search(r'(?:you\s*)?fragged\s+([A-Za-z0-9_\u4e00-\u9fff™\.\-\^ ]+?)(?:\.|$)', t, re.I)
                 if m:
-                    cn = clean_player_name(m.group(1), server_players)
+                    cn = clean_player_name(m.group(1).strip(), server_players)
                     if cn:
                         frag_victims[cn] += 20
                         frame_frag_found = True
 
-            if frame_frag_found and current_wep:
-                frag_weapons[current_wep] += 100
+            # 2. Top-right scoreboard roster check for newly dead enemies (<Player> DEAD)
+            roster_roi = frame[0:int(h * 0.12), int(w * 0.75):w]
+            res_rost, _ = engine(roster_roi)
+            rost_texts = [it[1].strip() for it in (res_rost or [])]
+            for idx, r_txt in enumerate(rost_texts):
+                if re.search(r'\bdead\b', r_txt, re.I):
+                    candidate = re.sub(r'\bdead\b', '', r_txt, flags=re.I).strip()
+                    if not candidate and idx > 0:
+                        candidate = rost_texts[idx - 1]
+                    cn = clean_player_name(candidate, server_players)
+                    if cn:
+                        roster_victims[cn] += 20
+                        frame_frag_found = True
 
-            # 2. Killfeed in top-left ('Player [weapon icon] <Victim>')
-            kf_roi = frame[int(h * 0.01):int(h * 0.15), int(w * 0.05):int(w * 0.45)]
+            # 3. Killfeed in top-left ('Player [weapon icon] <Victim>')
+            kf_roi = frame[int(h * 0.01):int(h * 0.15), int(w * 0.15):int(w * 0.45)]
             res_kf, _ = engine(kf_roi)
-            for it in res_kf or []:
-                t = it[1].strip()
-                if re.search(r'fragged\s+by|following', t, re.I):
-                    player_died = True
-                if re.search(r'telefrag', t, re.I):
-                    is_telefrag = True
-                m = re.search(r'aol[_\.\s]+\s*([A-Za-z0-9_\u4e00-\u9fff™\.\-\^]+)', t, re.I)
-                if m:
-                    cn = clean_player_name(m.group(1), server_players)
+            kf_all_text = " ".join([it[1].strip() for it in (res_kf or [])])
+            if not re.search(r'joined\s+the|disconnected|spectator', kf_all_text, re.I) and player_name.lower() in kf_all_text.lower():
+                for it in res_kf or []:
+                    t = it[1].strip()
+                    if re.search(r'fragged\s+by|following', t, re.I):
+                        player_died = True
+                    if re.search(r'telefrag', t, re.I):
+                        is_telefrag = True
+                    cn = clean_player_name(t, server_players)
                     if cn:
                         killfeed_victims[cn] += 10
-                        if current_wep:
-                            frag_weapons[current_wep] += 50
-                    # Red skull icon between killer and victim indicates telefrag
-                    hsv_kf = cv2.cvtColor(kf_roi, cv2.COLOR_BGR2HSV)
-                    m_red1 = cv2.inRange(hsv_kf, (0, 160, 160), (10, 255, 255))
-                    m_red2 = cv2.inRange(hsv_kf, (170, 160, 160), (180, 255, 255))
-                    if cv2.countNonZero(m_red1 | m_red2) > 80:
-                        is_telefrag = True
+                        frame_frag_found = True
+
+            if frame_frag_found and current_wep:
+                frag_weapons[current_wep] += 100
 
             # 3. Quake Live Medals at top-center (Midair wreath)
             # Note: Medal detection strictly requires verified OCR text to prevent false positives from loose HSV masks
@@ -411,7 +436,15 @@ def analyze_video_gameplay(video_path: str) -> dict:
             if e and e not in top_enemies:
                 top_enemies.append(e)
 
-        # Tier 2: Killfeed confirmation for additional victims
+        # Tier 2: Roster confirmation for eliminated opponents (<Victim> DEAD)
+        if len(top_enemies) < 2 and roster_victims:
+            for e, _ in roster_victims.most_common(2):
+                if e and e not in top_enemies:
+                    top_enemies.append(e)
+                    if len(top_enemies) >= 2:
+                        break
+
+        # Tier 3: Killfeed confirmation for additional victims
         if len(top_enemies) < 2 and killfeed_victims:
             for e, _ in killfeed_victims.most_common(2):
                 if e and e not in top_enemies:
@@ -419,7 +452,7 @@ def analyze_video_gameplay(video_path: str) -> dict:
                     if len(top_enemies) >= 2:
                         break
 
-        # Tier 3: In-combat crosshair nameplate during sustained combat/damage (single duel opponent if no frag confirmed)
+        # Tier 4: In-combat crosshair nameplate during sustained combat/damage (single duel opponent if no frag confirmed)
         if not top_enemies and combat_names:
             for e, score in combat_names.most_common(5):
                 if e and score >= 3:
@@ -1265,6 +1298,16 @@ def get_action_excitement_metadata(weapon: str = "", feat: str = "", title: str 
         emojis = ["💀", "⚡", "🔥"]
         banner_main = "EXCELLENT MEDAL!"
         banner_sub = "TWO FAST FRAGS"
+    elif "two direct rockets" in t or "2 direct rockets" in t or "rockets to the face" in t or "two direct rockets" in f or "2 direct rockets" in f or "rockets to the face" in f:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["🚀", "💥", "💀"]
+        banner_main = "2 DIRECT ROCKETS TO THE FACE!"
+        banner_sub = "ROCKET LAUNCHER (100 + 100 DMG)"
+    elif "plasma" in w or "plasma" in t or "plasma" in f:
+        vo = "sound/vo/holy_shit.ogg"
+        emojis = ["🟣", "⚡", "💀"]
+        banner_main = "MELTED BY PLASMA GUN!"
+        banner_sub = "HUNTED DOWN AFTER RUNNING AWAY" if ("run" in t or "run" in f or "hunt" in t) else "PLASMA FINISH"
     elif "rocket" in w or "rocket" in t:
         vo = "sound/vo/holy_shit.ogg"
         emojis = ["🚀", "💥", "🎯"]
@@ -1357,6 +1400,13 @@ def detect_action_climax_window(video_path: str, max_duration: float = None) -> 
                 elif re.search(r"fragged\b", tc, re.I):
                     score += 60
                     boxes.append(box)
+
+            # Check top-right roster for enemy elimination confirmation (<Player> DEAD)
+            roster_roi = frame[0:int(h * 0.12), int(w * 0.75):w]
+            res_r, _ = engine(roster_roi)
+            for box, txt, _ in (res_r or []):
+                if re.search(r'\bdead\b', txt, re.I):
+                    score += 90
             if score > best_score:
                 best_score = score
                 best_t = t
@@ -1433,7 +1483,8 @@ def render_action_slowmo_short(
     slowmo_speed: float = 0.25,
     enable_zoom: bool = True,
     enable_emojis: bool = True,
-    enable_audio_sfx: bool = True
+    enable_audio_sfx: bool = True,
+    action_climax_window: tuple = None
 ) -> bool:
     try:
         import cv2
@@ -1452,7 +1503,7 @@ def render_action_slowmo_short(
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        climax_data = detect_action_climax_window(video_path, max_duration=limit_time)
+        climax_data = action_climax_window or detect_action_climax_window(video_path, max_duration=limit_time)
         if not climax_data:
             cap.release()
             return False
@@ -1710,7 +1761,7 @@ def render_action_slowmo_short(
         print(f"Action slow-mo render notice on {video_path}: {e}")
         return False
 
-def convert_to_shorts_format(video_path: str, output_path: str = None, style: str = "crop", max_duration: float = None, subtitles_ass_path: str = None, include_hud: bool = True, target_lufs: float = -15.0, true_peak: float = -1.5, weapon: str = "", feat: str = "", custom_title: str = "", enable_action_slowmo: bool = True, slowmo_speed: float = 0.25, enable_zoom: bool = True, enable_emojis: bool = True, enable_audio_sfx: bool = True) -> str:
+def convert_to_shorts_format(video_path: str, output_path: str = None, style: str = "crop", max_duration: float = None, subtitles_ass_path: str = None, include_hud: bool = True, target_lufs: float = -15.0, true_peak: float = -1.5, weapon: str = "", feat: str = "", custom_title: str = "", enable_action_slowmo: bool = True, slowmo_speed: float = 0.25, enable_zoom: bool = True, enable_emojis: bool = True, enable_audio_sfx: bool = True, action_climax_window: tuple = None) -> str:
     """
     Converts 16:9 gameplay footage into 9:16 vertical YouTube Shorts format.
     Style B ('crop'):
@@ -1744,7 +1795,8 @@ def convert_to_shorts_format(video_path: str, output_path: str = None, style: st
             slowmo_speed=slowmo_speed,
             enable_zoom=enable_zoom,
             enable_emojis=enable_emojis,
-            enable_audio_sfx=enable_audio_sfx
+            enable_audio_sfx=enable_audio_sfx,
+            action_climax_window=action_climax_window
         )
         if success and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             return output_path

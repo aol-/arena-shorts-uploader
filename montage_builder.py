@@ -108,8 +108,8 @@ def ensure_music_track(selected_music=None):
     # Check local music directory
     music_files = sorted(list(MUSIC_DIR.glob("*.mp3")) + list(MUSIC_DIR.glob("*.wav")) + list(MUSIC_DIR.glob("*.ogg")))
     if music_files:
-        # Prefer Nectarine Demoscene Radio high-rated tracks, then curated tracks
-        for pref in ["Dubmood_Paradox_Crackchip_2.mp3", "Traven_Orange_Juice_Theme.mp3", "Raving_Energy.mp3", "Volatile_Reaction.mp3", "Future_Gladiator.mp3"]:
+        # Prefer configured or featured track, Nectarine Demoscene Radio high-rated tracks, then curated tracks
+        for pref in ["Cru_L_T_-_Krull.mp3", "Dubmood_Paradox_Crackchip_2.mp3", "Traven_Orange_Juice_Theme.mp3", "Raving_Energy.mp3", "Volatile_Reaction.mp3", "Future_Gladiator.mp3"]:
             p = MUSIC_DIR / pref
             if p.exists():
                 return str(p)
@@ -581,7 +581,7 @@ def main():
     result_path = build_montage(
         clips=clips,
         output_path=args.output,
-        music_track=args.music,
+        music_track=(args.music or config.get("music_track") or config.get("music")),
         featured_player=featured_player,
         transition_type=transition,
         transition_dur=trans_dur,

@@ -1,1 +1,1 @@
-# Arena Shorts Uploader v0.3.0
+# Arena Shorts Uploader v0.4.0
