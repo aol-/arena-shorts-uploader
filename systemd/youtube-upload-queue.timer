@@ -1,0 +1,12 @@
+[Unit]
+Description=Timer for Arena Shorts YouTube Queued Uploader
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:00/30
+OnCalendar=*-*-* 03:05:00
+OnCalendar=*-*-* 04:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
