@@ -4,12 +4,15 @@ import sys
 import re
 import json
 import time
+import fcntl
 import random
 import shutil
 import subprocess
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter
+from zoneinfo import ZoneInfo
 
 # Ensure site-packages with cv2, rapidocr_onnxruntime, etc. are available
 dictate_site = os.path.expanduser("~/.local/share/dictate-env/lib/python3.14/site-packages")
@@ -35,6 +38,15 @@ TOKEN_FILE = CONFIG_DIR / "token.json"
 CLIENT_SECRETS_FILE = CONFIG_DIR / "client_secrets.json"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OVERRIDES_FILE = CONFIG_DIR / "clip_overrides.json"
+QUEUE_DIR = CONFIG_DIR / "queue"
+QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+QUEUE_STATE_FILE = QUEUE_DIR / "state.json"
+QUEUE_LOCK_FILE = CONFIG_DIR / ".queue.lock"
+QUEUE_WORKER_LOCK_FILE = CONFIG_DIR / ".queue_worker.lock"
+UPLOAD_HISTORY_FILE = CONFIG_DIR / "upload_history.json"
+QUEUE_LOG_FILE = CONFIG_DIR / "queue.log"
+PT_TZ = ZoneInfo("America/Los_Angeles")
+RETRYABLE_UPLOAD_ERRORS = {"uploadLimitExceeded", "quotaExceeded", "transientError"}
 
 TEMPLATES_WITH_ENEMY_AND_WEAPON = [
     "SICK {weapon} PLAY! ⚡💀 {player} vs {enemy}",
@@ -148,7 +160,7 @@ def notify(title, body="", icon="video-x-generic", expire_ms=3000):
 
 def load_config():
     defaults = {
-        "account_name": "youtube",
+        "account_name": "YouTube",
         "email": "you@example.com",
         "chrome_profile": "Default",
         "player_name": "Player",
@@ -185,15 +197,15 @@ IGNORE_WORDS = {
     'fight!', 'fight', 'round begins in', 'round', 'begins', 'fog pit', 'upper cou', 'hallway',
     'fps', '250fps', '250f', 'mega', 'quad', 'stairs', 'the', 'and', 'red', 'blue', 'draw',
     'k/d', 'score', 'score k/d', 'score k', 'teams are tied', 'ping', 'time', 'dmg', 'acc', 'lead', 'tied',
-    'red wins the round', 'matchinprogress', 'players', 'community server', 'community server - overkill',
+    'red wins the round', 'matchinprogress', 'players',
     'player stats', 'player', 'player (6/6)', 'dmg weap', 'item to use', 'no item to use', 'item to u',
-    'dead and gone', 'dead and', 'community server - dead and gone', 'community server - aerowalk',
+    'dead and gone', 'dead and',
     'aerowalk', 'verticalvengeance', 'overkill', '12players', 'veap', 'the last s', 'last s',
     'grinder', 'beams', 'blood run', 'the last standing', 'live', 'quake live', 'quake', 'quakelive',
     'dead', 'noitem', 'noitemtouse', 'no item to use', 'team'
 }
 
-def clean_player_name(raw: str, server_players: list = None) -> str:
+def clean_player_name(raw: str, server_players: list = None, player_name: str = 'Player') -> str:
     s = raw.strip()
     s = re.sub(r'\s*\d+fps.*$', '', s, flags=re.I)
     s = re.sub(r'^(red|blue)\s+team\s*', '', s, flags=re.I)
@@ -222,7 +234,7 @@ def clean_player_name(raw: str, server_players: list = None) -> str:
         return ''
     if re.match(r'^k/?d$', s, re.I):
         return ''
-    if s.lower() in ['player', 'you']:
+    if s.lower() in [player_name.lower(), 'player', 'you']:
         return ''
     if server_players:
         import difflib
@@ -235,13 +247,13 @@ def clean_player_name(raw: str, server_players: list = None) -> str:
                     return sp
     return s.strip()
 
-def analyze_video_gameplay(video_path: str) -> dict:
+def analyze_video_gameplay(video_path: str, player_name: str = 'Player') -> dict:
     """
     Automatically analyzes the video using computer vision & OCR
     to detect enemy names, weapon used, and combat feats with zero user input.
     Prioritizes:
       1. Center Frag Announcement ('You fragged <Victim>.')
-      2. Top-Left Killfeed ('Player [icon] <Victim>')
+      2. Top-Left Killfeed ('<Player> [icon] <Victim>')
       3. In-Combat Crosshair Nameplate during damage
     Completely avoids bystander names from the server scoreboard/roster.
     """
@@ -362,11 +374,12 @@ def analyze_video_gameplay(video_path: str) -> dict:
                         roster_victims[cn] += 20
                         frame_frag_found = True
 
-            # 3. Killfeed in top-left ('Player [weapon icon] <Victim>')
+            # 3. Killfeed in top-left ('<Player> [weapon icon] <Victim>')
             kf_roi = frame[int(h * 0.01):int(h * 0.15), int(w * 0.15):int(w * 0.45)]
             res_kf, _ = engine(kf_roi)
             kf_all_text = " ".join([it[1].strip() for it in (res_kf or [])])
-            if not re.search(r'joined\s+the|disconnected|spectator', kf_all_text, re.I) and player_name.lower() in kf_all_text.lower():
+            p_tok = re.sub(r"[^a-z0-9]", "", player_name.lower())
+            if not re.search(r'joined\s+the|disconnected|spectator', kf_all_text, re.I) and (not p_tok or p_tok in re.sub(r"[^a-z0-9]", "", kf_all_text.lower())):
                 for it in res_kf or []:
                     t = it[1].strip()
                     if re.search(r'fragged\s+by|following', t, re.I):
@@ -431,7 +444,7 @@ def analyze_video_gameplay(video_path: str) -> dict:
 
         # Multi-victim detection (captures both players in two-frag clips):
         top_enemies = []
-        # Tier 1: Players explicitly fragged by Player ('You fragged <Victim>.')
+        # Tier 1: Players explicitly fragged ('You fragged <Victim>.')
         for e, _ in frag_victims.most_common(2):
             if e and e not in top_enemies:
                 top_enemies.append(e)
@@ -874,10 +887,8 @@ QUAKE_COLOR_MAP = {
 }
 
 def load_quake_chat_binds() -> dict:
-    cfg_paths = [
-        Path.home() / '.local/share/Steam/steamapps/common/Quake Live/YOUR_STEAM_ID/baseq3/repconfig.cfg',
-        Path.home() / '.local/share/Steam/steamapps/common/Quake Live/YOUR_STEAM_ID/baseq3/autoexec.cfg',
-    ]
+    ql_root = Path.home() / '.local/share/Steam/steamapps/common/Quake Live'
+    cfg_paths = sorted(list(ql_root.glob('*/baseq3/repconfig.cfg')) + list(ql_root.glob('*/baseq3/autoexec.cfg')))
     binds = {}
     for p in cfg_paths:
         if p.exists():
@@ -932,7 +943,7 @@ def detect_crop_quake_color(crop) -> str:
 
 def enrich_detected_quake_text(raw_ocr_text: str, binds: dict, player_name: str = "Player", roi=None, boxes=None) -> str:
     txt = raw_ocr_text.strip()
-    m_player = re.match(r'^(Player)\s*:\s*(.*)', txt, re.I)
+    m_player = re.match(r'^' + re.escape(player_name) + r'\s*:\s*(.*)', txt, re.I)
     if m_player:
         p_name = player_name
         msg = m_player.group(2).strip()
@@ -1939,8 +1950,8 @@ def get_quake_server_info() -> dict:
     
     server_addr = ''
     # 1. Try repconfig.cfg
-    rep_cfg = Path.home() / ".local/share/Steam/steamapps/common/Quake Live/YOUR_STEAM_ID/baseq3/repconfig.cfg"
-    if rep_cfg.exists():
+    rep_cfgs = sorted((Path.home() / ".local/share/Steam/steamapps/common/Quake Live").glob("*/baseq3/repconfig.cfg"))
+    for rep_cfg in rep_cfgs[:1]:
         try:
             with open(rep_cfg, 'r', encoding='latin1', errors='ignore') as f:
                 for line in f:
@@ -2012,7 +2023,7 @@ def get_quake_server_info() -> dict:
             null_pos = resp_p.find(b'\x00', idx)
             p_name = clean_quake_string(resp_p[idx:null_pos].decode('utf-8', errors='replace'))
             idx = null_pos + 9
-            if p_name and p_name not in players and p_name.lower() != 'Player':
+            if p_name and p_name not in players:
                 players.append(p_name)
         info['players'] = players
     except Exception as e:
@@ -2177,7 +2188,7 @@ def handle_browser_upload(video_path: str, config: dict, enemy: str = "", weapon
 
     cmd = [
         "zenity", "--question",
-        "--title=Export to YouTube (YouTube)",
+        "--title=Export to YouTube",
         f"--text={msg}",
         "--ok-label=Open in YouTube Studio",
         "--cancel-label=Setup Background API",
@@ -2220,7 +2231,354 @@ def handle_browser_upload(video_path: str, config: dict, enemy: str = "", weapon
             "--width=550"
         ])
 
-def get_authenticated_service():
+def _read_json_file(path: Path, default):
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return default
+
+
+def _write_json_atomic(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+@contextmanager
+def _queue_lock():
+    QUEUE_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(QUEUE_LOCK_FILE, "w", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+
+
+def _log_queue(msg: str):
+    ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts_str}] {msg}"
+    print(line)
+    try:
+        QUEUE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(QUEUE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _record_successful_upload(video_id: str, title: str):
+    with _queue_lock():
+        history = _read_json_file(UPLOAD_HISTORY_FILE, [])
+        if not isinstance(history, list):
+            history = []
+        now_ts = time.time()
+        history.append({
+            "ts": now_ts,
+            "iso": datetime.fromtimestamp(now_ts).astimezone().isoformat(),
+            "video_id": video_id,
+            "title": title,
+        })
+        _write_json_atomic(UPLOAD_HISTORY_FILE, history[-100:])
+
+
+def _next_pt_quota_reset_ts(now_ts: float = None) -> float:
+    now_ts = now_ts or time.time()
+    pt_now = datetime.fromtimestamp(now_ts, PT_TZ)
+    next_mid = datetime(pt_now.year, pt_now.month, pt_now.day, 0, 3, tzinfo=PT_TZ) + timedelta(days=1)
+    return next_mid.timestamp()
+
+
+def _compute_next_retry_at(reason: str, state: dict, now_ts: float = None) -> tuple:
+    now_ts = now_ts or time.time()
+    pt_day = datetime.fromtimestamp(now_ts, PT_TZ).strftime("%Y-%m-%d")
+    prev_day = state.get("limit_hits_pt_day")
+    hits_today = int(state.get("limit_hits_today", 0)) if prev_day == pt_day else 0
+
+    if reason == "quotaExceeded":
+        return _next_pt_quota_reset_ts(now_ts), pt_day, hits_today + 1
+
+    if reason == "uploadLimitExceeded":
+        hits_today += 1
+        history = _read_json_file(UPLOAD_HISTORY_FILE, [])
+        cutoff_24h = now_ts - 86400
+        recent = sorted(
+            float(item["ts"]) for item in history
+            if isinstance(item, dict) and item.get("ts") and float(item["ts"]) >= cutoff_24h
+        )
+        candidate_slot_ts = None
+        if len(recent) >= 6:
+            slot_ts = recent[0] + 86400 + 180
+            if (now_ts + 900) <= slot_ts <= (now_ts + 14400):
+                candidate_slot_ts = slot_ts
+
+        # Space out probes (2h -> 3h -> 4h) so repeated checks don't exhaust the 10k API unit quota
+        backoff_sec = 7200 if hits_today == 1 else (10800 if hits_today == 2 else 14400)
+        return (candidate_slot_ts or (now_ts + backoff_sec)), pt_day, hits_today
+
+    return now_ts + 900, pt_day, hits_today
+
+
+def _read_queue_state() -> dict:
+    with _queue_lock():
+        state = _read_json_file(QUEUE_STATE_FILE, {})
+        return state if isinstance(state, dict) else {}
+
+
+def _is_limit_cooldown_active(state: dict, now_ts: float = None) -> bool:
+    now_ts = now_ts or time.time()
+    return (
+        state.get("limit_reason") in ("uploadLimitExceeded", "quotaExceeded")
+        and float(state.get("next_retry_at", 0) or 0) > now_ts
+    )
+
+
+def _record_limit_state(reason: str, now_ts: float = None) -> dict:
+    now_ts = now_ts or time.time()
+    with _queue_lock():
+        state = _read_json_file(QUEUE_STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
+        next_ts, pt_day, hits_today = _compute_next_retry_at(reason, state, now_ts=now_ts)
+        state.update({
+            "limit_reason": reason,
+            "limit_hit_at": now_ts,
+            "limit_hit_iso": datetime.fromtimestamp(now_ts).astimezone().isoformat(),
+            "next_retry_at": next_ts,
+            "next_retry_iso": datetime.fromtimestamp(next_ts).astimezone().isoformat(),
+            "limit_hits_pt_day": pt_day,
+            "limit_hits_today": hits_today,
+        })
+        _write_json_atomic(QUEUE_STATE_FILE, state)
+        return state
+
+
+def _clear_limit_state():
+    with _queue_lock():
+        state = _read_json_file(QUEUE_STATE_FILE, {})
+        if isinstance(state, dict) and any(k in state for k in ("limit_reason", "next_retry_at", "limit_hit_at")):
+            for k in ("limit_reason", "limit_hit_at", "limit_hit_iso", "next_retry_at", "next_retry_iso"):
+                state.pop(k, None)
+            _write_json_atomic(QUEUE_STATE_FILE, state)
+
+
+def _format_retry_time(ts: float) -> str:
+    if not ts:
+        return "next scheduled check"
+    return datetime.fromtimestamp(ts).astimezone().strftime("%b %d %I:%M %p")
+
+
+def _get_pending_job_dirs() -> list:
+    if not QUEUE_DIR.exists():
+        return []
+    jobs = []
+    for d in QUEUE_DIR.iterdir():
+        if not d.is_dir() or d.name.startswith("_") or d.name.startswith("."):
+            continue
+        jf = d / "job.json"
+        if jf.is_file():
+            data = _read_json_file(jf, None)
+            if isinstance(data, dict) and data.get("pending_parts"):
+                jobs.append((float(data.get("created_at", 0.0)), d, data))
+    jobs.sort(key=lambda item: item[0])
+    return jobs
+
+
+def _archive_uploaded_sources(
+    source_video_path: str,
+    queued_source_path: str = None,
+    shorts_archive_dir: str = None,
+    final_uploaded_dir: str = None,
+):
+    """
+    Moves the uploaded source clip into 'uploaded/' and any companion *_Short.mp4
+    files into sibling '../shorts/'. Works whether source starts in 'exported/' or 'exported/queued/'.
+    """
+    dest_moved_path = None
+    try:
+        candidate = None
+        for raw in (queued_source_path, source_video_path):
+            if raw:
+                p = Path(raw).resolve()
+                if p.is_file():
+                    candidate = p
+                    break
+        if not candidate:
+            return None
+
+        base_export_dir = candidate.parent.parent if candidate.parent.name in ("queued", "uploaded") else candidate.parent
+        uploaded_dir = Path(final_uploaded_dir) if final_uploaded_dir else (base_export_dir / "uploaded")
+        shorts_dir = Path(shorts_archive_dir) if shorts_archive_dir else (base_export_dir.parent / "shorts")
+
+        if candidate.name.lower().endswith("_short.mp4"):
+            shorts_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(candidate), str(shorts_dir / candidate.name))
+            print(f"Moved Short file out of exported: {shorts_dir / candidate.name}")
+            base_stem = re.sub(r'(_telefrag)?_short$', '', candidate.stem, flags=re.I)
+            for search_dir in (base_export_dir, base_export_dir / "queued"):
+                base_orig = search_dir / f"{base_stem}.mp4"
+                if base_orig.is_file():
+                    uploaded_dir.mkdir(parents=True, exist_ok=True)
+                    dest_target = uploaded_dir / base_orig.name
+                    shutil.move(str(base_orig), str(dest_target))
+                    dest_moved_path = dest_target
+                    print(f"Moved original video to subfolder: {dest_target}")
+                    break
+        elif candidate.parent != uploaded_dir:
+            uploaded_dir.mkdir(parents=True, exist_ok=True)
+            dest_target = uploaded_dir / candidate.name
+            shutil.move(str(candidate), str(dest_target))
+            dest_moved_path = dest_target
+            print(f"Moved uploaded video to subfolder: {dest_target}")
+            for search_dir in (base_export_dir, base_export_dir / "queued"):
+                for comp in search_dir.glob(f"{candidate.stem}*_Short.mp4"):
+                    if comp.is_file():
+                        shorts_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(comp), str(shorts_dir / comp.name))
+                        print(f"Moved companion Short out of exported: {shorts_dir / comp.name}")
+    except Exception as move_err:
+        print(f"Notice: Could not move uploaded video: {move_err}")
+    return dest_moved_path
+
+
+def _notify_upload_success(uploaded_links: list, dest_moved_path, privacy: str, from_queue: bool = False):
+    if not uploaded_links:
+        return
+    primary_link = uploaded_links[0]
+    try:
+        subprocess.run(["wl-copy", "\n".join(uploaded_links)], check=True, timeout=2)
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(["pw-play", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    prefix = "Queued " if from_queue else ""
+    subfolder_note = f"\nMoved clip to: {dest_moved_path.parent.name}/" if dest_moved_path else ""
+    vis = str(privacy or "public").upper()
+    if len(uploaded_links) > 1:
+        notify(f"✅ {prefix}Dual YouTube Upload Complete! ({vis})", f"📱 Short: {uploaded_links[0]}\n🖥️ 1440p: {uploaded_links[1]}{subfolder_note}", icon="dialog-ok", expire_ms=8000)
+    else:
+        notify(f"✅ {prefix}YouTube Upload Complete! ({vis})", f"Link copied: {primary_link}{subfolder_note}", icon="dialog-ok", expire_ms=7000)
+
+
+def _enqueue_upload_job(
+    original_video_path: str,
+    pending_specs: list,
+    uploaded_links: list,
+    reason: str,
+    temp_trimmed_source: str = None,
+) -> tuple:
+    """
+    Persists pre-rendered Short/Widescreen media, thumbnail, and metadata under
+    ~/.config/youtube-upload/queue/ and stages the source clip in exported/queued/.
+    """
+    orig_path = Path(original_video_path).resolve()
+    orig_parent_name = orig_path.parent.name
+    base_export_dir = orig_path.parent.parent if orig_parent_name in ("queued", "uploaded") else orig_path.parent
+    final_uploaded_dir = base_export_dir / "uploaded"
+    shorts_archive_dir = base_export_dir.parent / "shorts"
+    safe_stem = re.sub(r'[^\w\-]', '_', orig_path.stem)[:48] or "clip"
+    job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_{safe_stem}"
+    job_dir = QUEUE_DIR / job_id
+
+    with _queue_lock():
+        job_dir.mkdir(parents=True, exist_ok=True)
+        queued_source = None
+        if orig_path.is_file():
+            if orig_parent_name == "queued":
+                queued_source = orig_path
+            elif orig_parent_name != "uploaded":
+                queued_dir = orig_path.parent / "queued"
+                queued_dir.mkdir(parents=True, exist_ok=True)
+                queued_source = queued_dir / orig_path.name
+                shutil.move(str(orig_path), str(queued_source))
+                print(f"[Queue] Moved source clip -> {queued_source}")
+
+        moved_files = {}
+        persisted_parts = []
+        for idx, spec in enumerate(pending_specs):
+            part = dict(spec)
+            src_media = part.get("file_path")
+            if src_media:
+                src_p = Path(src_media)
+                if queued_source and not part.get("delete_media_on_done") and src_p.resolve() == orig_path:
+                    part["file_path"] = str(queued_source)
+                elif part.get("delete_media_on_done") and src_p.is_file():
+                    if src_media in moved_files:
+                        part["file_path"] = moved_files[src_media]
+                    else:
+                        ext = src_p.suffix or ".mp4"
+                        dst_media = job_dir / f"part{idx}_{part.get('kind', 'video')}{ext}"
+                        shutil.move(str(src_p), str(dst_media))
+                        moved_files[src_media] = str(dst_media)
+                        part["file_path"] = str(dst_media)
+
+            src_thumb = part.get("thumb_path")
+            if src_thumb and os.path.isfile(src_thumb):
+                if src_thumb in moved_files:
+                    part["thumb_path"] = moved_files[src_thumb]
+                else:
+                    dst_thumb = job_dir / f"part{idx}_{part.get('kind', 'video')}_thumb.jpg"
+                    shutil.move(src_thumb, str(dst_thumb))
+                    moved_files[src_thumb] = str(dst_thumb)
+                    part["thumb_path"] = str(dst_thumb)
+
+            persisted_parts.append(part)
+
+        if temp_trimmed_source and temp_trimmed_source not in moved_files and os.path.exists(temp_trimmed_source):
+            try:
+                os.remove(temp_trimmed_source)
+            except OSError:
+                pass
+
+        now_ts = time.time()
+        job_data = {
+            "id": job_id,
+            "created_at": now_ts,
+            "created_iso": datetime.fromtimestamp(now_ts).astimezone().isoformat(),
+            "reason": reason,
+            "attempts": 1,
+            "source_video_path": str(orig_path),
+            "queued_source_path": str(queued_source) if queued_source else None,
+            "final_uploaded_dir": str(final_uploaded_dir),
+            "shorts_archive_dir": str(shorts_archive_dir),
+            "uploaded_links": list(uploaded_links),
+            "pending_parts": persisted_parts,
+        }
+        _write_json_atomic(job_dir / "job.json", job_data)
+
+        # Deduplicate older pending jobs pointing to the same clip & destination
+        for _, old_dir, old_data in _get_pending_job_dirs():
+            if old_dir == job_dir:
+                continue
+            if (
+                old_data.get("final_uploaded_dir") == str(final_uploaded_dir)
+                and Path(old_data.get("source_video_path", "")).name == orig_path.name
+            ):
+                shutil.rmtree(old_dir, ignore_errors=True)
+
+        total_pending = len(_get_pending_job_dirs())
+
+    _log_queue(f"Enqueued {orig_path.name} ({len(persisted_parts)} part(s), reason={reason}). Queue size: {total_pending}")
+    return job_dir, total_pending
+
+
+def _is_transient_auth_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "name resolution", "temporary failure", "timed out", "connectionerror",
+        "max retries exceeded", "connection reset", "network is unreachable",
+        "502", "503", "504",
+    ))
+
+
+def _authenticate_youtube(headless: bool = False):
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
@@ -2242,23 +2600,71 @@ def get_authenticated_service():
                     token.write(creds.to_json())
             except Exception as e:
                 print("Token refresh failed:", e)
+                if headless and _is_transient_auth_error(e):
+                    return None, "transient"
                 creds = None
 
         if not creds:
+            if headless:
+                return None, "auth_required"
             if not CLIENT_SECRETS_FILE.exists():
-                return None
+                return None, "missing_secrets"
 
-            notify("Authentication Required", "Please approve access in your browser for account: youtube", expire_ms=5000)
+            notify("Authentication Required", "Please approve access in your browser for YouTube.", expire_ms=5000)
             flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS_FILE), SCOPES)
             creds = flow.run_local_server(port=0)
             with open(TOKEN_FILE, "w") as token:
                 token.write(creds.to_json())
             notify("Authentication Successful!", "Saved credentials for YouTube.", expire_ms=3000)
 
-    from googleapiclient.discovery import build
-    return build("youtube", "v3", credentials=creds)
+    return build("youtube", "v3", credentials=creds), None
 
-def _execute_video_upload(youtube, file_path: str, title: str, description: str, tags: list, category_id: str, privacy: str, thumb_path: str = None) -> tuple:
+
+def get_authenticated_service(headless: bool = False):
+    service, _ = _authenticate_youtube(headless=headless)
+    return service
+
+
+def _classify_upload_exception(exc: Exception):
+    text_parts = [str(exc)]
+    content = getattr(exc, "content", None)
+    if isinstance(content, (bytes, bytearray)):
+        text_parts.append(content.decode("utf-8", errors="ignore"))
+    elif content is not None:
+        text_parts.append(str(content))
+    details = getattr(exc, "error_details", None)
+    if details:
+        text_parts.append(str(details))
+    msg_lower = " ".join(text_parts).lower()
+
+    if "uploadlimitexceeded" in msg_lower:
+        return "uploadLimitExceeded"
+    if "quotaexceeded" in msg_lower or "dailylimitexceeded" in msg_lower:
+        return "quotaExceeded"
+
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status in (429, 500, 502, 503, 504):
+        return "transientError"
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)) or any(
+        k in msg_lower for k in (
+            "timed out", "temporary failure in name resolution", "name resolution",
+            "connection reset", "connection aborted", "broken pipe", "ssl", "eof occurred",
+        )
+    ):
+        return "transientError"
+    return None
+
+
+def _execute_video_upload_with_status(
+    youtube,
+    file_path: str,
+    title: str,
+    description: str,
+    tags: list,
+    category_id: str,
+    privacy: str,
+    thumb_path: str = None,
+) -> tuple:
     from googleapiclient.http import MediaFileUpload
     body = {
         "snippet": {
@@ -2273,7 +2679,7 @@ def _execute_video_upload(youtube, file_path: str, title: str, description: str,
         }
     }
 
-    media = MediaFileUpload(file_path, chunksize=10*1024*1024, resumable=True)
+    media = MediaFileUpload(file_path, chunksize=10 * 1024 * 1024, resumable=True)
     request = youtube.videos().insert(
         part=",".join(body.keys()),
         body=body,
@@ -2288,14 +2694,14 @@ def _execute_video_upload(youtube, file_path: str, title: str, description: str,
                 progress = int(status.progress() * 100)
                 print(f"Uploading ({Path(file_path).name}): {progress}%")
     except Exception as e:
-        if "uploadLimitExceeded" in str(e):
-            notify("⚠️ YouTube Daily Upload Limit Reached", "YouTube limits standard channels to 10 uploads/day.\nYour quota will reset in ~24 hours.", icon="dialog-warning", expire_ms=8000)
-            print("YouTube daily upload limit reached (10 uploads/24h). Quota will reset in ~24 hours.")
-            return None, None
-        raise e
+        err_kind = _classify_upload_exception(e)
+        if err_kind:
+            print(f"[Upload Deferred] {err_kind}: {e}")
+            return None, None, err_kind
+        raise
 
     if not response or "id" not in response:
-        return None, None
+        return None, None, "transientError"
 
     video_id = response.get("id")
     video_url = f"https://youtu.be/{video_id}"
@@ -2312,11 +2718,201 @@ def _execute_video_upload(youtube, file_path: str, title: str, description: str,
             print("Thumbnail upload warning:", e)
         finally:
             if os.path.exists(thumb_path):
-                os.remove(thumb_path)
+                try:
+                    os.remove(thumb_path)
+                except OSError:
+                    pass
 
-    return video_id, video_url
+    return video_id, video_url, None
 
-def upload_video(video_path: str, enemy: str = None, weapon: str = None, special_play: str = None, custom_title: str = None, prompt: bool = False, shorts: bool = None, shorts_style: str = None, dual_upload: bool = None, cut_on_death: bool = None, include_hud: bool = None, player: str = None, custom_desc: str = None, action_slowmo: bool = None, slowmo_speed: float = None, action_zoom: bool = None, action_emojis: bool = None, action_audio: bool = None, start_time: float = None):
+
+def _execute_video_upload(youtube, file_path: str, title: str, description: str, tags: list, category_id: str, privacy: str, thumb_path: str = None) -> tuple:
+    vid_id, vid_url, err_kind = _execute_video_upload_with_status(
+        youtube, file_path, title, description, tags, category_id, privacy, thumb_path
+    )
+    if err_kind == "uploadLimitExceeded":
+        notify("⚠️ YouTube Daily Upload Limit Reached", "YouTube limits standard channels to 10 uploads/day.\nYour quota will reset in ~24 hours.", icon="dialog-warning", expire_ms=8000)
+    elif err_kind == "quotaExceeded":
+        notify("⚠️ YouTube API Quota Reached", "YouTube API daily quota exceeded.\nWill retry after midnight PT reset.", icon="dialog-warning", expire_ms=8000)
+    return vid_id, vid_url
+
+
+def _cleanup_temp_files(paths: list):
+    for p in paths:
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def process_upload_queue(force: bool = False) -> int:
+    """
+    Processes queued YouTube uploads FIFO once any daily upload/API limit cooldown
+    has elapsed (or immediately when force=True).
+    """
+    QUEUE_WORKER_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(QUEUE_WORKER_LOCK_FILE, "w", encoding="utf-8") as worker_lock:
+        try:
+            fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("[Queue] Another queue worker is already running; skipping.")
+            return 0
+
+        jobs = _get_pending_job_dirs()
+        if not jobs:
+            _clear_limit_state()
+            return 0
+
+        state = _read_queue_state()
+        now_ts = time.time()
+        if not force and float(state.get("next_retry_at", 0) or 0) > now_ts:
+            print(
+                f"[Queue] {len(jobs)} item(s) waiting ({state.get('limit_reason', 'cooldown')}); "
+                f"next retry at {_format_retry_time(state['next_retry_at'])}."
+            )
+            return 0
+
+        youtube, auth_err = _authenticate_youtube(headless=True)
+        if not youtube:
+            if auth_err == "transient":
+                state = _record_limit_state("transientError")
+                _log_queue(f"Network/DNS error refreshing OAuth token; retrying at {_format_retry_time(state['next_retry_at'])}.")
+                return 0
+            _log_queue(f"Authentication required ({auth_err}); waiting for interactive sign-in.")
+            notify(
+                "🔐 YouTube Re-Auth Needed",
+                f"{len(jobs)} queued clip(s) waiting. Export one clip manually or sign in to refresh token.",
+                icon="dialog-warning",
+                expire_ms=9000,
+            )
+            return 1
+
+        _log_queue(f"Processing {len(jobs)} queued upload job(s)...")
+        succeeded_jobs = 0
+
+        for _, job_dir, job in jobs:
+            pending_parts = list(job.get("pending_parts") or [])
+            uploaded_links = list(job.get("uploaded_links") or [])
+            last_privacy = "public"
+
+            while pending_parts:
+                part = pending_parts[0]
+                last_privacy = part.get("privacy", last_privacy)
+                media_path = part.get("file_path")
+
+                # Fall back to archived/source clip path if a non-temporary media path was moved
+                if (not media_path or not os.path.exists(media_path)) and not part.get("delete_media_on_done"):
+                    for cand in (job.get("queued_source_path"), job.get("source_video_path")):
+                        if cand and os.path.exists(cand):
+                            media_path = cand
+                            break
+
+                if not media_path or not os.path.exists(media_path):
+                    _log_queue(f"[Queue Warn] Missing media for {job_dir.name}; moving job to _failed.")
+                    failed_dir = QUEUE_DIR / "_failed"
+                    failed_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(job_dir), str(failed_dir / job_dir.name))
+                    pending_parts = None
+                    break
+
+                thumb_path = part.get("thumb_path")
+                if thumb_path and not os.path.exists(thumb_path):
+                    thumb_path = None
+
+                try:
+                    vid_id, vid_url, err_kind = _execute_video_upload_with_status(
+                        youtube,
+                        media_path,
+                        part.get("title", "Quake Live Highlight"),
+                        part.get("description", ""),
+                        part.get("tags") or [],
+                        str(part.get("category_id", "20")),
+                        part.get("privacy", "public"),
+                        thumb_path,
+                    )
+                except Exception as exc:
+                    attempts = int(job.get("attempts", 0)) + 1
+                    job["attempts"] = attempts
+                    job["last_error"] = str(exc)
+                    job["last_attempt_at"] = time.time()
+                    _write_json_atomic(job_dir / "job.json", job)
+                    _log_queue(f"[Queue Error] Unexpected failure on {job_dir.name} (attempt {attempts}): {exc}")
+                    if attempts >= 5:
+                        failed_dir = QUEUE_DIR / "_failed"
+                        failed_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(job_dir), str(failed_dir / job_dir.name))
+                    pending_parts = None
+                    break
+
+                if vid_id:
+                    _record_successful_upload(vid_id, part.get("title", ""))
+                    _clear_limit_state()
+                    link = f"https://www.youtube.com/shorts/{vid_id}" if part.get("kind") == "shorts" else vid_url
+                    uploaded_links.append(link)
+                    pending_parts.pop(0)
+                    if part.get("delete_media_on_done"):
+                        _cleanup_temp_files([media_path, thumb_path])
+                    job["pending_parts"] = pending_parts
+                    job["uploaded_links"] = uploaded_links
+                    _write_json_atomic(job_dir / "job.json", job)
+                    _log_queue(f"[Queue Uploaded] {part.get('kind', 'video')} -> {link}")
+                    continue
+
+                if err_kind in RETRYABLE_UPLOAD_ERRORS:
+                    job["attempts"] = int(job.get("attempts", 0)) + 1
+                    job["reason"] = err_kind
+                    job["last_attempt_at"] = time.time()
+                    _write_json_atomic(job_dir / "job.json", job)
+                    state = _record_limit_state(err_kind)
+                    remaining = len(_get_pending_job_dirs())
+                    _log_queue(
+                        f"[Queue Paused] Hit {err_kind}; {remaining} clip(s) remain queued. "
+                        f"Next retry: {_format_retry_time(state['next_retry_at'])}"
+                    )
+                    return 0
+
+            if pending_parts is None:
+                continue
+
+            # Job completed: archive original clip out of queued/ into uploaded/ and remove job artifacts
+            dest_moved = _archive_uploaded_sources(
+                job.get("source_video_path"),
+                queued_source_path=job.get("queued_source_path"),
+                shorts_archive_dir=job.get("shorts_archive_dir"),
+                final_uploaded_dir=job.get("final_uploaded_dir"),
+            )
+            shutil.rmtree(job_dir, ignore_errors=True)
+            _notify_upload_success(uploaded_links, dest_moved, last_privacy, from_queue=True)
+            succeeded_jobs += 1
+
+        if not _get_pending_job_dirs():
+            _clear_limit_state()
+            _log_queue(f"Queue drain complete ({succeeded_jobs} job(s) uploaded, 0 remaining).")
+        else:
+            _log_queue(f"Queue pass complete ({succeeded_jobs} job(s) uploaded).")
+        return 0
+
+
+def print_queue_status():
+    jobs = _get_pending_job_dirs()
+    state = _read_queue_state()
+    print(f"Pending queued clips: {len(jobs)}")
+    if state.get("limit_reason"):
+        print(
+            f"Active limit state  : {state['limit_reason']} "
+            f"(hit {_format_retry_time(state.get('limit_hit_at'))}, "
+            f"next retry {_format_retry_time(state.get('next_retry_at'))})"
+        )
+    else:
+        print("Active limit state  : none")
+    for idx, (_, job_dir, data) in enumerate(jobs, 1):
+        src_name = Path(data.get("source_video_path", job_dir.name)).name
+        parts_str = ", ".join(p.get("kind", "video") for p in data.get("pending_parts", []))
+        print(f"  {idx}. {src_name} [{parts_str}] | attempts={data.get('attempts', 0)} | reason={data.get('reason')}")
+
+
+def upload_video(video_path: str, enemy: str = None, weapon: str = None, special_play: str = None, custom_title: str = None, prompt: bool = False, shorts: bool = None, shorts_style: str = None, dual_upload: bool = None, cut_on_death: bool = None, include_hud: bool = None, player: str = None, custom_desc: str = None, action_slowmo: bool = None, slowmo_speed: float = None, action_zoom: bool = None, action_emojis: bool = None, action_audio: bool = None, start_time: float = None, force_upload: bool = False):
     if not os.path.exists(video_path):
         notify("Upload Failed", f"File not found: {video_path}", icon="dialog-error")
         return
@@ -2349,6 +2945,9 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         if res_trim.returncode == 0 and os.path.exists(temp_trimmed_source) and os.path.getsize(temp_trimmed_source) > 1000:
             print(f"[Clip Trim] Cut beginning from 0.0s to {start_time:.2f}s as requested.")
             video_path = temp_trimmed_source
+        else:
+            _cleanup_temp_files([temp_trimmed_source])
+            temp_trimmed_source = None
 
     player_name = player or overrides.get("player") or config.get("player_name", "Player")
     enemy = enemy or overrides.get("enemy")
@@ -2361,15 +2960,15 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         e, w, s, c = prompt_frag_details(video_path, player_name)
         if e is None and w is None and s is None and c is None:
             print("Upload cancelled by user.")
+            _cleanup_temp_files([temp_trimmed_source])
             return
         enemy = e or enemy or ""
         weapon = w or weapon or ""
         special_play = s or special_play or ""
         custom_title = c or custom_title or ""
     elif not enemy or not weapon:
-        # Zero-input mode: automatically analyze video footage
         notify("🔍 Analyzing Video...", f"{Path(video_path).name}\nDetecting enemy frags & weapons...", icon="video-x-generic", expire_ms=3000)
-        auto_data = analyze_video_gameplay(video_path)
+        auto_data = analyze_video_gameplay(video_path, player_name=player_name)
         enemy = enemy or auto_data.get("enemy", "")
         weapon = weapon or auto_data.get("weapon", "")
         special_play = special_play or auto_data.get("feat", "")
@@ -2385,13 +2984,11 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
     except Exception:
         pass
 
-    # Ending cut calculation (stops before player respawn, post-round scoreboard, or recording chime)
     should_cut = cut_on_death if cut_on_death is not None else config.get("cut_before_respawn", config.get("cut_on_death", True))
     cut_chime_enabled = config.get("cut_recording_chime", True)
     cutoff_delay = float(config.get("death_cutoff_delay", 0.5))
 
     cut_duration = None
-    cut_reason = None
     if should_cut or cut_chime_enabled:
         has_cut, cut_t, total_d, reason = detect_clip_cut_point(
             video_path,
@@ -2402,10 +2999,8 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         )
         if has_cut and cut_t < dur - 0.1:
             cut_duration = cut_t
-            cut_reason = reason
             print(f"[Clip Cut] Ending trimmed to {cut_duration:.2f}s ({reason}) to cut out erroneous post-round/respawn/chime footage.")
 
-    # Shorts decision: if shorts is True, or if shorts is None and shorts_mode config is True and dur <= 60s
     is_shorts = (shorts is True) or (shorts is None and config.get("shorts_mode", True) and dur <= 60.0)
     shorts_style = shorts_style or config.get("shorts_style", "crop")
     should_dual = dual_upload if dual_upload is not None else config.get("dual_upload", True)
@@ -2417,36 +3012,29 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
     enable_emojis = action_emojis if action_emojis is not None else config.get("action_emojis", True)
     enable_audio_sfx = action_audio if action_audio is not None else config.get("action_excitement_audio", True)
 
-    # Left-side chat & announcements subtitle overlay
     subtitles_ass = None
     if is_shorts and config.get("display_left_chat", True):
         subtitles_ass = generate_chat_subtitles(video_path, max_duration=cut_duration, player_name=player_name)
 
-    # Check credentials
     if not TOKEN_FILE.exists() and not CLIENT_SECRETS_FILE.exists():
+        _cleanup_temp_files([subtitles_ass])
         handle_browser_upload(video_path, config, enemy, weapon, special_play, custom_title)
-        return
-
-    youtube = get_authenticated_service()
-    if not youtube:
-        handle_browser_upload(video_path, config, enemy, weapon, special_play, custom_title)
+        _cleanup_temp_files([temp_trimmed_source])
         return
 
     privacy = config.get("privacy_status", "public")
     cat_id = str(config.get("category_id", "20"))
     server_info = get_quake_server_info()
-
-    uploaded_links = []
+    upload_parts = []
 
     if is_shorts:
-        # 1. Upload Vertical YouTube Short
         style_desc = "full-screen vertical trim" if shorts_style == "crop" else "blurred background"
         cut_notice = f"\nStopping at {cut_duration:.1f}s (cut before respawn)" if cut_duration else ""
         chat_notice = "\nChat text displayed at bottom" if subtitles_ass else ""
         hud_notice = "\nHUD (Scores & Health/Armor) included" if should_include_hud else ""
         slowmo_notice = f"\nAction Climax Slow-Mo ({speed_action_slowmo}x) & SFX" if (shorts_style == "crop" and enable_action_slowmo) else ""
         notify("📱 Creating YouTube Short (9:16)...", f"{Path(video_path).name}{cut_notice}{chat_notice}{hud_notice}{slowmo_notice}\nFormatting {style_desc} with NVENC...", icon="video-x-generic", expire_ms=3500)
-        
+
         shorts_target = None
         target_lufs = float(config.get("audio_loudness_i", -15.0))
         target_tp = float(config.get("audio_true_peak", -1.5))
@@ -2470,127 +3058,168 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
             )
         except Exception as e:
             print("Shorts conversion failed:", e)
+        finally:
+            _cleanup_temp_files([subtitles_ass])
 
         if shorts_target and os.path.exists(shorts_target):
             s_title, s_desc, s_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=True, server_info=server_info, player=player_name, custom_desc=custom_desc)
-            detail_line = f"Target: {enemy} | Weapon: {weapon}" if enemy else f"Weapon: {weapon}"
-            notify("⏳ Uploading YouTube Short...", f"{s_title}\n{detail_line}\nVisibility: {privacy.upper()}", icon="emblem-synchronizing", expire_ms=4000)
-            
             s_thumb = None
             try:
                 s_thumb = extract_action_thumbnail(shorts_target)
             except Exception:
                 pass
+            upload_parts.append({
+                "kind": "shorts",
+                "file_path": shorts_target,
+                "thumb_path": s_thumb,
+                "title": s_title,
+                "description": s_desc,
+                "tags": s_tags,
+                "category_id": cat_id,
+                "privacy": privacy,
+                "delete_media_on_done": True,
+            })
 
-            try:
-                s_id, _ = _execute_video_upload(youtube, shorts_target, s_title, s_desc, s_tags, cat_id, privacy, s_thumb)
-                if s_id:
-                    s_url = f"https://www.youtube.com/shorts/{s_id}"
-                    uploaded_links.append(s_url)
-            finally:
-                if os.path.exists(shorts_target):
-                    try:
-                        os.remove(shorts_target)
-                    except Exception:
-                        pass
-
-        if subtitles_ass and os.path.exists(subtitles_ass):
-            try:
-                os.remove(subtitles_ass)
-            except Exception:
-                pass
-
-        # 2. Dual upload: Also upload the original 16:9 widescreen 1440p version
         if should_dual:
-            notify("🖥️ Uploading 1440p Widescreen Version...", f"Original 2560x1440 60FPS for {Path(video_path).name}...", icon="emblem-synchronizing", expire_ms=4000)
             w_title, w_desc, w_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=False, server_info=server_info, player=player_name, custom_desc=custom_desc)
-            
             w_thumb = None
             try:
                 w_thumb = extract_action_thumbnail(video_path)
             except Exception:
                 pass
-
-            w_id, w_url = _execute_video_upload(youtube, video_path, w_title, w_desc, w_tags, cat_id, privacy, w_thumb)
-            if w_url:
-                uploaded_links.append(w_url)
-
+            upload_parts.append({
+                "kind": "widescreen",
+                "file_path": video_path,
+                "thumb_path": w_thumb,
+                "title": w_title,
+                "description": w_desc,
+                "tags": w_tags,
+                "category_id": cat_id,
+                "privacy": privacy,
+                "delete_media_on_done": bool(temp_trimmed_source and video_path == temp_trimmed_source),
+            })
     else:
-        # Standard Widescreen 16:9 Upload only
         w_title, w_desc, w_tags = generate_metadata(video_path, config, enemy, weapon, special_play, custom_title, is_shorts=False, server_info=server_info, player=player_name, custom_desc=custom_desc)
-        detail_line = f"Target: {enemy} | Weapon: {weapon}" if enemy else f"Weapon: {weapon}"
-        notify("⏳ Uploading Video to YouTube...", f"{w_title}\n{detail_line}\nVisibility: {privacy.upper()}", icon="emblem-synchronizing", expire_ms=5000)
-
         w_thumb = None
         try:
             w_thumb = extract_action_thumbnail(video_path)
         except Exception:
             pass
+        upload_parts.append({
+            "kind": "widescreen",
+            "file_path": video_path,
+            "thumb_path": w_thumb,
+            "title": w_title,
+            "description": w_desc,
+            "tags": w_tags,
+            "category_id": cat_id,
+            "privacy": privacy,
+            "delete_media_on_done": bool(temp_trimmed_source and video_path == temp_trimmed_source),
+        })
 
-        w_id, w_url = _execute_video_upload(youtube, video_path, w_title, w_desc, w_tags, cat_id, privacy, w_thumb)
-        if w_url:
-            uploaded_links.append(w_url)
+    if not upload_parts:
+        _cleanup_temp_files([temp_trimmed_source])
+        return
 
-    # Clipboard and completion notifications
-    if uploaded_links:
-        primary_link = uploaded_links[0]
-        try:
-            subprocess.run(["wl-copy", "\n".join(uploaded_links)], check=True)
-        except Exception:
-            pass
+    # If a daily limit cooldown is already active, queue right away without wasting API quota
+    queue_state = _read_queue_state()
+    if not force_upload and _is_limit_cooldown_active(queue_state):
+        limit_reason = queue_state.get("limit_reason", "uploadLimitExceeded")
+        _, total_pending = _enqueue_upload_job(
+            original_video_to_move, upload_parts, [], limit_reason, temp_trimmed_source=temp_trimmed_source
+        )
+        notify(
+            f"⏳ Queued for Auto-Upload (#{total_pending})",
+            f"{Path(original_video_to_move).name}\nYouTube limit active — auto-retry at {_format_retry_time(queue_state.get('next_retry_at'))}.",
+            icon="dialog-information",
+            expire_ms=7000,
+        )
+        return
 
-        # Move original widescreen video to 'uploaded/' and move any *_Short.mp4 derivatives to '../shorts/'
-        dest_moved_path = None
-        try:
-            v_orig = Path(original_video_to_move).resolve()
-            shorts_archive_dir = v_orig.parent.parent / "shorts"
-            if v_orig.is_file() and v_orig.name.lower().endswith("_short.mp4"):
-                shorts_archive_dir.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(v_orig), str(shorts_archive_dir / v_orig.name))
-                print(f"Moved Short file out of exported: {shorts_archive_dir / v_orig.name}")
-                # Also move its original widescreen source into uploaded/ if still in exported/
-                base_stem = re.sub(r'(_telefrag)?_short$', '', v_orig.stem, flags=re.I)
-                base_orig = v_orig.parent / f"{base_stem}.mp4"
-                if base_orig.is_file() and v_orig.parent.name != "uploaded":
-                    dest_dir = v_orig.parent / "uploaded"
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    dest_target = dest_dir / base_orig.name
-                    shutil.move(str(base_orig), str(dest_target))
-                    dest_moved_path = dest_target
-                    print(f"Moved original video to subfolder: {dest_target}")
-            elif v_orig.is_file() and v_orig.parent.name != "uploaded":
-                dest_dir = v_orig.parent / "uploaded"
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest_target = dest_dir / v_orig.name
-                shutil.move(str(v_orig), str(dest_target))
-                dest_moved_path = dest_target
-                print(f"Moved uploaded video to subfolder: {dest_target}")
-                # Sweep any companion *_Short.mp4 renders out of exported/
-                for comp in v_orig.parent.glob(f"{v_orig.stem}*_Short.mp4"):
-                    if comp.is_file():
-                        shorts_archive_dir.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(comp), str(shorts_archive_dir / comp.name))
-                        print(f"Moved companion Short out of exported: {shorts_archive_dir / comp.name}")
-        except Exception as move_err:
-            print(f"Notice: Could not move uploaded video: {move_err}")
+    youtube = get_authenticated_service()
+    if not youtube:
+        _cleanup_temp_files([p.get("thumb_path") for p in upload_parts] + [p.get("file_path") for p in upload_parts if p.get("delete_media_on_done")])
+        handle_browser_upload(video_path, config, enemy, weapon, special_play, custom_title)
+        _cleanup_temp_files([temp_trimmed_source])
+        return
 
-        subprocess.Popen(["pw-play", "/usr/share/sounds/freedesktop/stereo/complete.oga"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subfolder_note = f"\nMoved clip to: {dest_moved_path.parent.name}/" if dest_moved_path else ""
-        if len(uploaded_links) > 1:
-            notify("✅ Dual YouTube Upload Complete! (PUBLIC)", f"📱 Short: {uploaded_links[0]}\n🖥️ 1440p: {uploaded_links[1]}{subfolder_note}", icon="dialog-ok", expire_ms=8000)
+    uploaded_links = []
+    for idx, part in enumerate(upload_parts):
+        if part["kind"] == "shorts":
+            detail_line = f"Target: {enemy} | Weapon: {weapon}" if enemy else f"Weapon: {weapon}"
+            notify("⏳ Uploading YouTube Short...", f"{part['title']}\n{detail_line}\nVisibility: {privacy.upper()}", icon="emblem-synchronizing", expire_ms=4000)
+        elif is_shorts:
+            notify("🖥️ Uploading 1440p Widescreen Version...", f"Original 2560x1440 60FPS for {Path(video_path).name}...", icon="emblem-synchronizing", expire_ms=4000)
         else:
-            notify("✅ YouTube Upload Complete! (PUBLIC)", f"Link copied: {primary_link}{subfolder_note}", icon="dialog-ok", expire_ms=7000)
+            detail_line = f"Target: {enemy} | Weapon: {weapon}" if enemy else f"Weapon: {weapon}"
+            notify("⏳ Uploading Video to YouTube...", f"{part['title']}\n{detail_line}\nVisibility: {privacy.upper()}", icon="emblem-synchronizing", expire_ms=5000)
 
-    if temp_trimmed_source and os.path.exists(temp_trimmed_source):
-        try:
-            os.remove(temp_trimmed_source)
-        except Exception:
-            pass
+        vid_id, vid_url, err_kind = _execute_video_upload_with_status(
+            youtube,
+            part["file_path"],
+            part["title"],
+            part["description"],
+            part["tags"],
+            part["category_id"],
+            part["privacy"],
+            part.get("thumb_path"),
+        )
+
+        if vid_id:
+            _record_successful_upload(vid_id, part["title"])
+            _clear_limit_state()
+            link = f"https://www.youtube.com/shorts/{vid_id}" if part["kind"] == "shorts" else vid_url
+            uploaded_links.append(link)
+            if part.get("delete_media_on_done"):
+                _cleanup_temp_files([part.get("file_path")])
+            continue
+
+        if err_kind in RETRYABLE_UPLOAD_ERRORS:
+            state = _record_limit_state(err_kind)
+            _, total_pending = _enqueue_upload_job(
+                original_video_to_move,
+                upload_parts[idx:],
+                uploaded_links,
+                err_kind,
+                temp_trimmed_source=temp_trimmed_source,
+            )
+            retry_str = _format_retry_time(state.get("next_retry_at"))
+            if err_kind == "uploadLimitExceeded":
+                notify(
+                    f"⏳ Daily Limit Reached — Queued (#{total_pending})",
+                    f"{Path(original_video_to_move).name}\nWill auto-upload once an opening frees up.\nNext check: {retry_str}",
+                    icon="dialog-warning",
+                    expire_ms=9000,
+                )
+            elif err_kind == "quotaExceeded":
+                notify(
+                    f"⏳ API Quota Reached — Queued (#{total_pending})",
+                    f"{Path(original_video_to_move).name}\nWill auto-upload after midnight PT reset.\nNext check: {retry_str}",
+                    icon="dialog-warning",
+                    expire_ms=9000,
+                )
+            else:
+                notify(
+                    f"⏳ Upload Deferred — Queued (#{total_pending})",
+                    f"{Path(original_video_to_move).name}\nTemporary network error — next retry: {retry_str}",
+                    icon="dialog-warning",
+                    expire_ms=8000,
+                )
+            return
+
+    _cleanup_temp_files([temp_trimmed_source])
+    if uploaded_links:
+        dest_moved = _archive_uploaded_sources(original_video_to_move)
+        _notify_upload_success(uploaded_links, dest_moved, privacy, from_queue=False)
+
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Quake Live YouTube Uploader for YouTube")
-    parser.add_argument("video", help="Path to video file")
+    parser = argparse.ArgumentParser(description="Quake Live / Arena FPS YouTube Shorts Uploader")
+    parser.add_argument("video", nargs="?", default=None, help="Path to video file")
+    parser.add_argument("--process-queue", action="store_true", help="Upload pending queued clips whose retry window is due")
+    parser.add_argument("--queue-status", action="store_true", help="Display pending upload queue status")
+    parser.add_argument("--force-queue", "--force-upload", dest="force_queue", action="store_true", help="Ignore cooldown backoff when uploading or draining queue")
     parser.add_argument("--enemy", default=None, help="Enemy player name(s)")
     parser.add_argument("--weapon", default=None, help="Weapon used")
     parser.add_argument("--feat", default=None, help="Special feat / highlight")
@@ -2619,6 +3248,14 @@ if __name__ == "__main__":
     parser.add_argument("--start-time", "--ss", type=float, default=None, help="Start time in seconds to cut off beginning of video")
     args = parser.parse_args()
 
+    if args.queue_status:
+        print_queue_status()
+        sys.exit(0)
+    if args.process_queue:
+        sys.exit(process_upload_queue(force=args.force_queue))
+    if not args.video:
+        parser.error("the following arguments are required: video (or use --process-queue / --queue-status)")
+
     upload_video(
         video_path=args.video,
         enemy=args.enemy,
@@ -2638,5 +3275,6 @@ if __name__ == "__main__":
         action_zoom=args.action_zoom,
         action_emojis=args.action_emojis,
         action_audio=args.action_audio,
-        start_time=args.start_time
+        start_time=args.start_time,
+        force_upload=args.force_queue,
     )

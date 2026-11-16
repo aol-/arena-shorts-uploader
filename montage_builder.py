@@ -2,7 +2,7 @@
 """
 Quake Live Video Montage Generator
 Consolidates all un-montaged Quake Live clips into a seamless, high-energy frag montage:
-  - Cuts off clips right after the featured player (Player) dies before transitioning
+  - Cuts off clips right after the featured player dies before transitioning
   - Crossfades video and audio smoothly between clips using FFmpeg xfade/acrossfade
   - Mixes background techno music underneath crisp gameplay SFX
   - Hardware-accelerated 1440p 60FPS encoding via NVIDIA NVENC
@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Paths
-DEFAULT_EXPORT_DIR = Path("~/Videos/SteamClips/exported")
+DEFAULT_EXPORT_DIR = Path(os.environ.get("STEAM_EXPORT_DIR", str(Path.home() / "Videos/SteamClips")))
 DEFAULT_UPLOADED_DIR = DEFAULT_EXPORT_DIR / "uploaded"
 CONFIG_DIR = Path.home() / ".config/youtube-upload"
 CONFIG_FILE = CONFIG_DIR / "config.json"
