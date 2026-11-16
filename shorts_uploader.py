@@ -2482,16 +2482,17 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
             except Exception:
                 pass
 
-            s_id, _ = _execute_video_upload(youtube, shorts_target, s_title, s_desc, s_tags, cat_id, privacy, s_thumb)
-            if s_id:
-                s_url = f"https://www.youtube.com/shorts/{s_id}"
-                uploaded_links.append(s_url)
-
-            if os.path.exists(shorts_target):
-                try:
-                    os.remove(shorts_target)
-                except Exception:
-                    pass
+            try:
+                s_id, _ = _execute_video_upload(youtube, shorts_target, s_title, s_desc, s_tags, cat_id, privacy, s_thumb)
+                if s_id:
+                    s_url = f"https://www.youtube.com/shorts/{s_id}"
+                    uploaded_links.append(s_url)
+            finally:
+                if os.path.exists(shorts_target):
+                    try:
+                        os.remove(shorts_target)
+                    except Exception:
+                        pass
 
         if subtitles_ass and os.path.exists(subtitles_ass):
             try:
@@ -2538,17 +2539,38 @@ def upload_video(video_path: str, enemy: str = None, weapon: str = None, special
         except Exception:
             pass
 
-        # Move uploaded video to 'uploaded' subfolder
+        # Move original widescreen video to 'uploaded/' and move any *_Short.mp4 derivatives to '../shorts/'
         dest_moved_path = None
         try:
             v_orig = Path(original_video_to_move).resolve()
-            if v_orig.is_file() and v_orig.parent.name != "uploaded":
+            shorts_archive_dir = v_orig.parent.parent / "shorts"
+            if v_orig.is_file() and v_orig.name.lower().endswith("_short.mp4"):
+                shorts_archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(v_orig), str(shorts_archive_dir / v_orig.name))
+                print(f"Moved Short file out of exported: {shorts_archive_dir / v_orig.name}")
+                # Also move its original widescreen source into uploaded/ if still in exported/
+                base_stem = re.sub(r'(_telefrag)?_short$', '', v_orig.stem, flags=re.I)
+                base_orig = v_orig.parent / f"{base_stem}.mp4"
+                if base_orig.is_file() and v_orig.parent.name != "uploaded":
+                    dest_dir = v_orig.parent / "uploaded"
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest_target = dest_dir / base_orig.name
+                    shutil.move(str(base_orig), str(dest_target))
+                    dest_moved_path = dest_target
+                    print(f"Moved original video to subfolder: {dest_target}")
+            elif v_orig.is_file() and v_orig.parent.name != "uploaded":
                 dest_dir = v_orig.parent / "uploaded"
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest_target = dest_dir / v_orig.name
                 shutil.move(str(v_orig), str(dest_target))
                 dest_moved_path = dest_target
                 print(f"Moved uploaded video to subfolder: {dest_target}")
+                # Sweep any companion *_Short.mp4 renders out of exported/
+                for comp in v_orig.parent.glob(f"{v_orig.stem}*_Short.mp4"):
+                    if comp.is_file():
+                        shorts_archive_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(comp), str(shorts_archive_dir / comp.name))
+                        print(f"Moved companion Short out of exported: {shorts_archive_dir / comp.name}")
         except Exception as move_err:
             print(f"Notice: Could not move uploaded video: {move_err}")
 

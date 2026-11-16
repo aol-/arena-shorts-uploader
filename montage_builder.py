@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Quake Live 2-Week Video Montage Generator
-Consolidates Quake Live clips from the last 14 days into a seamless, high-energy frag montage:
+Quake Live Video Montage Generator
+Consolidates all un-montaged Quake Live clips into a seamless, high-energy frag montage:
   - Cuts off clips right after the featured player (Player) dies before transitioning
   - Crossfades video and audio smoothly between clips using FFmpeg xfade/acrossfade
   - Mixes background techno music underneath crisp gameplay SFX
@@ -83,7 +83,6 @@ def copy_to_clipboard(text):
 def load_config():
     defaults = {
         "player_name": "Player",
-        "montage_days": 14,
         "transition_type": "fade",
         "transition_duration": 0.5,
         "music_volume": 0.38,
@@ -161,12 +160,12 @@ def ensure_music_track(selected_music=None):
         print(f"Synthesis failed: {e}")
         return None
 
-def find_clips(input_files=None, search_dir=None, days=14):
+def find_clips(input_files=None, search_dir=None, days=None):
     """
     Finds Quake Live clips to include in the montage.
     If input_files is provided, uses those.
-    Otherwise finds all clips from search_dir (defaults to 'uploaded' subfolder)
-    created/modified within `days` days.
+    Otherwise includes all un-montaged clips from search_dir (defaults to 'uploaded'
+    subfolder), optionally filtered to `days` if explicitly specified.
     """
     if input_files:
         valid_files = [f for f in input_files if os.path.isfile(f) and f.lower().endswith(('.mp4', '.mkv', '.mov'))]
@@ -185,30 +184,29 @@ def find_clips(input_files=None, search_dir=None, days=14):
     if not search_dir.exists():
         search_dir = Path.cwd()
 
-    all_mp4s = sorted(search_dir.glob("*.mp4"))
     now = time.time()
-    cutoff_sec = days * 86400.0
+    cutoff_sec = (days * 86400.0) if (days is not None and days > 0) else None
 
-    selected = []
-    for f in all_mp4s:
-        fname = f.name
-        # Skip existing montages, shorts derivatives, thumbnails
-        if "montage" in fname.lower() or "_shorts_" in fname.lower() or fname.endswith("_thumb.jpg"):
-            continue
-        mtime = f.stat().st_mtime
-        if (now - mtime) <= cutoff_sec:
-            selected.append(str(f))
-
-    # If uploaded directory had no clips within the cutoff, fallback to main export dir
-    if not selected and search_dir == DEFAULT_UPLOADED_DIR and DEFAULT_EXPORT_DIR.exists():
-        fallback_mp4s = sorted(DEFAULT_EXPORT_DIR.glob("*.mp4"))
-        for f in fallback_mp4s:
-            fname = f.name
-            if "montage" in fname.lower() or "_shorts_" in fname.lower() or fname.endswith("_thumb.jpg"):
+    def collect_valid(directory: Path) -> list[str]:
+        found = []
+        for f in sorted(directory.glob("*.mp4")):
+            fname_low = f.name.lower()
+            # Skip existing montages, shorts derivatives, and thumbnails
+            if "montage" in fname_low or "_short" in fname_low or fname_low.endswith("_thumb.jpg"):
                 continue
-            mtime = f.stat().st_mtime
-            if (now - mtime) <= cutoff_sec:
-                selected.append(str(f))
+            if cutoff_sec is not None:
+                st = f.stat()
+                latest_ts = max(st.st_mtime, st.st_ctime)
+                if (now - latest_ts) > cutoff_sec:
+                    continue
+            found.append(str(f))
+        return found
+
+    selected = collect_valid(search_dir)
+
+    # If uploaded directory had no eligible clips, fallback to main export dir
+    if not selected and search_dir == DEFAULT_UPLOADED_DIR and DEFAULT_EXPORT_DIR.exists():
+        selected = collect_valid(DEFAULT_EXPORT_DIR)
 
     # Sort chronologically by filename / timestamp
     selected.sort()
@@ -344,18 +342,18 @@ def build_montage(
     """
     if not clips:
         print("No clips found to consolidate.")
-        notify("Quake Montage", "No clips found from the last 2 weeks.", icon="dialog-warning")
+        notify("Quake Montage", "No un-montaged clips found.", icon="dialog-warning")
         return None
 
     notify(
         "🎬 Creating Quake Live Montage...",
-        f"Processing {len(clips)} clips from the last 2 weeks\nDetecting player death cutoffs & smoothing transitions...",
+        f"Processing {len(clips)} clip(s)\nDetecting player death cutoffs & smoothing transitions...",
         icon="video-x-generic",
         expire_ms=5000
     )
 
     print(f"\n=======================================================")
-    print(f"🎬 QUAKE LIVE 2-WEEK MONTAGE GENERATOR")
+    print(f"🎬 QUAKE LIVE MONTAGE GENERATOR")
     print(f"Total clips found: {len(clips)}")
     print(f"Featured player: {featured_player}")
     print(f"Transition: {transition_type} ({transition_dur}s)")
@@ -533,9 +531,9 @@ def build_montage(
     return str(output_path)
 
 def main():
-    parser = argparse.ArgumentParser(description="Quake Live 2-Week Video Montage Generator")
-    parser.add_argument("files", nargs="*", help="Specific video files to include (default: scan last 14 days)")
-    parser.add_argument("--days", type=int, default=14, help="Number of days to look back for clips (default: 14)")
+    parser = argparse.ArgumentParser(description="Quake Live Video Montage Generator")
+    parser.add_argument("files", nargs="*", help="Specific video files to include (default: all un-montaged clips)")
+    parser.add_argument("--days", type=int, default=None, help="Optional lookback window in days (default: open-ended / all clips)")
     parser.add_argument("--dir", default=None, help="Directory to scan for Quake Live clips (default: exported/uploaded)")
     parser.add_argument("--player", default=None, help="Featured player name to detect deaths (default from config: Player)")
     parser.add_argument("--music", default=None, help="Path to custom background music track")
@@ -574,8 +572,10 @@ def main():
     clips = find_clips(input_files=input_files, search_dir=search_dir, days=args.days)
 
     if not clips:
-        print(f"No clips found in {search_dir} from the last {args.days} days.")
-        notify("Quake Montage", f"No Quake Live clips found in the last {args.days} days.", icon="dialog-warning")
+        loc = search_dir or DEFAULT_UPLOADED_DIR
+        window_msg = f" in the last {args.days} days" if args.days else ""
+        print(f"No clips found in {loc}{window_msg}.")
+        notify("Quake Montage", f"No un-montaged Quake Live clips found{window_msg}.", icon="dialog-warning")
         sys.exit(1)
 
     result_path = build_montage(
